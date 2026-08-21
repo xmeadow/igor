@@ -326,6 +326,19 @@ static char *run_tool(const char *name, const char *args_json) {
         return strdup("tool error: invalid arguments");
     }
 
+    /* Trace the tool call so the user can follow what the agent is doing. */
+    {
+        const char *detail = "";
+        if (strcmp(name, "run_command") == 0) {
+            const char *c = json_str(json_get(args, "command"));
+            if (c) detail = c;
+        } else if (strcmp(name, "read_file") == 0 || strcmp(name, "write_file") == 0) {
+            const char *p = json_str(json_get(args, "path"));
+            if (p) detail = p;
+        }
+        fprintf(stderr, "  -> %s: %s\n", name, detail);
+    }
+
     char *result = NULL;
     if (strcmp(name, "run_command") == 0) {
         const char *c = json_str(json_get(args, "command"));
