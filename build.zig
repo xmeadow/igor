@@ -16,6 +16,13 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+
+    // Optional compile-time defaults, baked into the binary and used only when
+    // the corresponding environment variable is unset at runtime. This lets the
+    // ISO build ship with demo credentials without hardcoding them in source.
+    const llm_api_key = b.option([]const u8, "llm_api_key", "Default API key (used when LLM_API_KEY is unset)");
+    const llm_base_url = b.option([]const u8, "llm_base_url", "Default base URL (used when LLM_BASE_URL is unset)");
+    const llm_model = b.option([]const u8, "llm_model", "Default model (used when LLM_MODEL is unset)");
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -87,6 +94,12 @@ pub fn build(b: *std.Build) void {
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
+    const opts = b.addOptions();
+    opts.addOption(?[]const u8, "llm_api_key", llm_api_key);
+    opts.addOption(?[]const u8, "llm_base_url", llm_base_url);
+    opts.addOption(?[]const u8, "llm_model", llm_model);
+    exe.root_module.addOptions("build_options", opts);
+
     b.installArtifact(exe);
 
     // This creates a top level step. Top level steps have a name and can be

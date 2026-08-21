@@ -1,6 +1,7 @@
 const std = @import("std");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
+const build_options = @import("build_options");
 
 const SYSTEM_PROMPT =
     "You are a coding agent. Solve the user's task by reading and writing files and running commands. " ++
@@ -13,12 +14,12 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
     const cfg = llm.Config{
-        .api_key = init.environ_map.get("LLM_API_KEY") orelse {
+        .api_key = init.environ_map.get("LLM_API_KEY") orelse build_options.llm_api_key orelse {
             std.debug.print("error: LLM_API_KEY is not set\n", .{});
             return error.MissingApiKey;
         },
-        .base_url = init.environ_map.get("LLM_BASE_URL") orelse "https://api.openai.com/v1",
-        .model = init.environ_map.get("LLM_MODEL") orelse "gpt-4o-mini",
+        .base_url = init.environ_map.get("LLM_BASE_URL") orelse build_options.llm_base_url orelse "https://api.openai.com/v1",
+        .model = init.environ_map.get("LLM_MODEL") orelse build_options.llm_model orelse "gpt-4o-mini",
     };
 
     const max_steps = std.fmt.parseInt(u32, init.environ_map.get("LLM_MAX_STEPS") orelse "8", 10) catch 8;
