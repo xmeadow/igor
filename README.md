@@ -93,6 +93,19 @@ igor "write a C program that prints hello world, then compile and run it"
 echo "find the bug in src/main.c and fix it" | igor
 ```
 
+### Other OpenAI-compatible providers
+
+Any OpenAI-compatible endpoint works - point it at the API root (no `/v1`):
+
+```sh
+export LLM_API_KEY=sk-...
+export LLM_BASE_URL=https://api.example.com   # e.g. DeepSeek, Mistral, a local server, ...
+export LLM_MODEL=your-model
+
+zig build
+./zig-out/bin/igor "write a C program, compile it, and run it"
+```
+
 ## How it works
 
 ```mermaid
