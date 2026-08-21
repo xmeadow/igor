@@ -103,7 +103,7 @@ igor/
 │   ├── agent.c       # agent loop, request/response, tool execution
 │   ├── http.c        # HTTPS POST (WinHTTP on Win32, OpenSSL on POSIX)
 │   └── json.c        # minimal JSON parser + string escaping
-└── build_iso.sh      # (gitignored) build + ISO packaging for ReactOS
+└── build_iso.sh      # (gitignored) build + ISO packaging + deploy
 ```
 
 ## ReactOS / Win32 notes
