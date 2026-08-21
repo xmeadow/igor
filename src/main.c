@@ -64,21 +64,36 @@ static char *ansi_to_utf8(const char *s) {
 }
 
 static char *read_line_utf8(FILE *f) {
+    (void)f;
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
     size_t cap = 256, len = 0;
     wchar_t *w = (wchar_t *)malloc(cap * sizeof(wchar_t));
     if (!w) return NULL;
-    wint_t c;
-    while ((c = fgetwc(f)) != WEOF) {
-        if (c == L'\n') break;
-        if (len + 1 >= cap) {
-            cap *= 2;
-            wchar_t *nw = (wchar_t *)realloc(w, cap * sizeof(wchar_t));
-            if (!nw) { free(w); return NULL; }
-            w = nw;
+
+    for (;;) {
+        wchar_t chunk[256];
+        DWORD nread = 0;
+        if (!ReadConsoleW(h, chunk, 256, &nread, NULL)) {
+            free(w);
+            return NULL;
         }
-        w[len++] = (wchar_t)c;
+        int stop = 0;
+        for (DWORD i = 0; i < nread; i++) {
+            wchar_t c = chunk[i];
+            if (c == L'\n') { stop = 1; break; }
+            if (c == L'\r') continue;
+            if (len + 1 >= cap) {
+                cap *= 2;
+                wchar_t *nw = (wchar_t *)realloc(w, cap * sizeof(wchar_t));
+                if (!nw) { free(w); return NULL; }
+                w = nw;
+            }
+            w[len++] = c;
+        }
+        if (stop || nread == 0) break;
     }
-    if (c == WEOF && len == 0) { free(w); return NULL; }
+
+    if (len == 0) { free(w); return NULL; }
     w[len] = 0;
     char *out = wide_to_utf8(w);
     free(w);
@@ -86,13 +101,20 @@ static char *read_line_utf8(FILE *f) {
 }
 
 static void out_puts(const char *s) {
-    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
-    if (n <= 0) return;
-    wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
-    if (!w) return;
-    MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
-    fputws(w, stdout);
-    free(w);
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+        int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+        if (n <= 0) return;
+        wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+        if (!w) return;
+        MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
+        DWORD written = 0;
+        WriteConsoleW(h, w, (DWORD)(n - 1), &written, NULL);
+        free(w);
+    } else {
+        fwrite(s, 1, strlen(s), stdout);
+    }
 }
 
 #else /* POSIX */
