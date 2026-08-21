@@ -8,6 +8,9 @@
 
 #ifdef _WIN32
 #include <io.h>
+#include <windows.h>
+#include <wchar.h>
+#include <wctype.h>
 #define stdin_is_tty() _isatty(_fileno(stdin))
 #else
 #include <unistd.h>
@@ -31,27 +34,70 @@ static const char *env_or(const char *name, const char *def) {
     return (v && *v) ? v : def;
 }
 
-/* Read the entire remaining stdin (used for a piped one-shot task). */
-static char *read_stdin(void) {
-    size_t cap = 4096, len = 0;
-    char *buf = (char *)malloc(cap);
-    if (!buf) return NULL;
-    size_t n;
-    while ((n = fread(buf + len, 1, cap - len - 1, stdin)) > 0) {
-        len += n;
-        if (len + 1 >= cap) {
-            cap *= 2;
-            char *nb = (char *)realloc(buf, cap);
-            if (!nb) { free(buf); return NULL; }
-            buf = nb;
-        }
-    }
-    buf[len] = 0;
-    return buf;
+/* ---- UTF-8 aware console I/O ----
+ *
+ * On Windows the console is in the OEM code page, not UTF-8. We read and write
+ * through the wide-character APIs and convert to/from UTF-8, so non-ASCII
+ * (umlauts, ...) round-trips correctly to the LLM API.
+ */
+
+#ifdef _WIN32
+
+static char *wide_to_utf8(const wchar_t *w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (n <= 0) return strdup("");
+    char *out = (char *)malloc((size_t)n);
+    if (!out) return NULL;
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, out, n, NULL, NULL);
+    return out; /* n includes the NUL terminator */
 }
 
-/* Read one line of arbitrary length; returns NULL on EOF with no input. */
-static char *read_line(FILE *f) {
+static char *ansi_to_utf8(const char *s) {
+    int n = MultiByteToWideChar(CP_ACP, 0, s, -1, NULL, 0);
+    if (n <= 0) return strdup(s);
+    wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+    if (!w) return strdup(s);
+    MultiByteToWideChar(CP_ACP, 0, s, -1, w, n);
+    char *out = wide_to_utf8(w);
+    free(w);
+    return out ? out : strdup(s);
+}
+
+static char *read_line_utf8(FILE *f) {
+    size_t cap = 256, len = 0;
+    wchar_t *w = (wchar_t *)malloc(cap * sizeof(wchar_t));
+    if (!w) return NULL;
+    wint_t c;
+    while ((c = fgetwc(f)) != WEOF) {
+        if (c == L'\n') break;
+        if (len + 1 >= cap) {
+            cap *= 2;
+            wchar_t *nw = (wchar_t *)realloc(w, cap * sizeof(wchar_t));
+            if (!nw) { free(w); return NULL; }
+            w = nw;
+        }
+        w[len++] = (wchar_t)c;
+    }
+    if (c == WEOF && len == 0) { free(w); return NULL; }
+    w[len] = 0;
+    char *out = wide_to_utf8(w);
+    free(w);
+    return out;
+}
+
+static void out_puts(const char *s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) return;
+    wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+    if (!w) return;
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
+    fputws(w, stdout);
+    free(w);
+}
+
+#else /* POSIX */
+
+static char *read_line_utf8(FILE *f) {
     size_t cap = 256, len = 0;
     char *buf = (char *)malloc(cap);
     if (!buf) return NULL;
@@ -71,6 +117,31 @@ static char *read_line(FILE *f) {
     return buf;
 }
 
+static void out_puts(const char *s) {
+    fputs(s, stdout);
+}
+
+#endif /* _WIN32 */
+
+/* Read the entire remaining stdin (piped one-shot task). */
+static char *read_stdin(void) {
+    size_t cap = 4096, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) return NULL;
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len - 1, stdin)) > 0) {
+        len += n;
+        if (len + 1 >= cap) {
+            cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) { free(buf); return NULL; }
+            buf = nb;
+        }
+    }
+    buf[len] = 0;
+    return buf;
+}
+
 static void trim(char *s) {
     char *p = s;
     while (*p == ' ' || *p == '\t') p++;
@@ -81,13 +152,12 @@ static void trim(char *s) {
 }
 
 static void print_help(void) {
-    printf(
-        "Commands:\n"
-        "  /help    show this help\n"
-        "  /clear   clear the conversation history\n"
-        "  /exit    quit (also /quit or 'exit')\n"
-        "\n"
-        "Anything else is sent to the agent.\n");
+    out_puts("Commands:\n"
+             "  /help    show this help\n"
+             "  /clear   clear the conversation history\n"
+             "  /exit    quit (also /quit or 'exit')\n"
+             "\n"
+             "Anything else is sent to the agent.\n");
     fflush(stdout);
 }
 
@@ -97,9 +167,16 @@ static int run_once(const agent_config_t *cfg, const char *task) {
         fprintf(stderr, "error: out of memory\n");
         return 1;
     }
-    int rc = agent_chat(s, task);
+    char *ans = agent_chat(s, task);
     agent_session_free(s);
-    return rc;
+    if (ans) {
+        out_puts(ans);
+        out_puts("\n");
+        free(ans);
+        fflush(stdout);
+        return 0;
+    }
+    return 1;
 }
 
 static int interactive_loop(const agent_config_t *cfg) {
@@ -109,17 +186,17 @@ static int interactive_loop(const agent_config_t *cfg) {
         return 1;
     }
 
-    printf("igor - coding agent. Type a task, or /help, /clear, /exit.\n");
+    out_puts("igor - coding agent. Type a task, or /help, /clear, /exit.\n\n");
     fflush(stdout);
 
     int rc = 0;
     for (;;) {
-        printf("igor> ");
+        out_puts("you> ");
         fflush(stdout);
 
-        char *line = read_line(stdin);
+        char *line = read_line_utf8(stdin);
         if (!line) {
-            printf("\n");
+            out_puts("\n");
             break;
         }
         trim(line);
@@ -139,15 +216,22 @@ static int interactive_loop(const agent_config_t *cfg) {
         }
         if (strcmp(line, "/clear") == 0) {
             agent_session_reset(s);
-            printf("conversation cleared\n");
+            out_puts("conversation cleared\n");
+            fflush(stdout);
             free(line);
             continue;
         }
 
-        rc = agent_chat(s, line);
+        char *ans = agent_chat(s, line);
         free(line);
-        printf("\n");
-        fflush(stdout);
+
+        if (ans) {
+            out_puts("igor> ");
+            out_puts(ans);
+            out_puts("\n\n");
+            free(ans);
+            fflush(stdout);
+        }
     }
 
     agent_session_free(s);
@@ -168,7 +252,14 @@ int main(int argc, char **argv) {
     if (cfg.max_steps <= 0) cfg.max_steps = 8;
 
     if (argc > 1) {
+#ifdef _WIN32
+        char *task = ansi_to_utf8(argv[1]);
+        int rc = run_once(&cfg, task);
+        free(task);
+        return rc;
+#else
         return run_once(&cfg, argv[1]);
+#endif
     }
 
     if (stdin_is_tty()) {

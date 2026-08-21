@@ -438,10 +438,10 @@ void agent_session_reset(agent_session_t *s) {
     add_system_message(&s->msgs);
 }
 
-int agent_chat(agent_session_t *s, const char *user_input) {
-    if (!msgs_add(&s->msgs, "user", user_input, NULL)) return 1;
+char *agent_chat(agent_session_t *s, const char *user_input) {
+    if (!msgs_add(&s->msgs, "user", user_input, NULL)) return NULL;
 
-    int rc = 0;
+    char *answer = NULL;
     int done = 0;
 
     for (int step = 0; step < s->cfg.max_steps && !done; step++) {
@@ -458,7 +458,6 @@ int agent_chat(agent_session_t *s, const char *user_input) {
         if (http_post(url, s->cfg.api_key, req.d, &status, &resp) != 0) {
             fprintf(stderr, "error: http request failed\n");
             sb_free(&req);
-            rc = 1;
             break;
         }
         sb_free(&req);
@@ -466,7 +465,6 @@ int agent_chat(agent_session_t *s, const char *user_input) {
         if (status != 200) {
             fprintf(stderr, "error: http status %ld\n%s\n", status, resp ? resp : "");
             free(resp);
-            rc = 1;
             break;
         }
 
@@ -478,9 +476,8 @@ int agent_chat(agent_session_t *s, const char *user_input) {
         if (ncalls == 0) {
             if (content) {
                 msgs_add(&s->msgs, "assistant", content, NULL);
-                printf("%s\n", content);
             }
-            free(content);
+            answer = content; /* transfer ownership to caller */
             done = 1;
             break;
         }
@@ -499,9 +496,8 @@ int agent_chat(agent_session_t *s, const char *user_input) {
         free(calls);
     }
 
-    if (!done && rc == 0) {
+    if (!done) {
         fprintf(stderr, "stopped after %d steps without a final answer\n", s->cfg.max_steps);
-        rc = 1;
     }
-    return rc;
+    return answer;
 }

@@ -15,7 +15,8 @@ agent_session_t *agent_session_new(const agent_config_t *cfg);
 void agent_session_free(agent_session_t *s);
 void agent_session_reset(agent_session_t *s);
 
-/* Sends one user message through the loop and prints the final answer. */
-int agent_chat(agent_session_t *s, const char *user_input);
+/* Sends one user message through the loop and returns the final answer
+ * (malloc'd, caller frees), or NULL on error. */
+char *agent_chat(agent_session_t *s, const char *user_input);
 
 #endif
