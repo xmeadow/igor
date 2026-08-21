@@ -49,12 +49,18 @@ Defaults can also be baked in at compile time with `make LLM_API_KEY=... LLM_BAS
 ## Usage
 
 ```sh
-# from a CLI argument
+# interactive chat (persistent conversation) when run in a terminal
+./igor
+
+# one-shot from a CLI argument
 ./igor "write a C program that prints hello world, then compile and run it"
 
-# or from stdin
+# one-shot from stdin
 echo "find the bug in main.c and fix it" | ./igor
 ```
+
+In interactive mode the conversation history is kept across turns. Slash
+commands: `/help`, `/clear` (reset history), `/exit` (quit).
 
 ### Other OpenAI-compatible providers
 
@@ -76,8 +82,16 @@ flowchart TD
     D -- yes --> E[Execute each tool]
     E --> F[Append tool results]
     F --> C
-    D -- no --> G[Print final text, exit]
+    D -- no --> G[Print final text]
 ```
+
+## Prep prompt
+
+The binary ships with a built-in system prompt that gives the model its
+identity, the list of tools, and operating rules (inspect before guessing,
+small focused changes, verify with build/tests, be concise). At runtime it is
+prefixed with the OS name and the working directory, so the model gets real
+context on every session.
 
 ## Project layout
 

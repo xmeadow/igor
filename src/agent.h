@@ -8,7 +8,14 @@ typedef struct {
     int max_steps;
 } agent_config_t;
 
-/* Runs the agent loop; prints the final answer to stdout. Returns 0 on success. */
-int agent_run(const agent_config_t *cfg, const char *task);
+/* Opaque conversation session; keeps the message history across turns. */
+typedef struct agent_session agent_session_t;
+
+agent_session_t *agent_session_new(const agent_config_t *cfg);
+void agent_session_free(agent_session_t *s);
+void agent_session_reset(agent_session_t *s);
+
+/* Sends one user message through the loop and prints the final answer. */
+int agent_chat(agent_session_t *s, const char *user_input);
 
 #endif

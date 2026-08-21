@@ -12,12 +12,16 @@
 #include <stdarg.h>
 
 #ifdef _WIN32
+#include <direct.h>
 #define POPEN _popen
 #define PCLOSE _pclose
+#define GETCWD _getcwd
 #else
+#include <unistd.h>
 #include <sys/wait.h>
 #define POPEN popen
 #define PCLOSE pclose
+#define GETCWD getcwd
 #endif
 
 #define MAX_READ (1024 * 1024) /* 1 MiB cap for command/file output */
@@ -29,10 +33,29 @@ static const char *TOOLS_JSON =
     "{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"Create or overwrite a file with the given contents.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}}"
     "]";
 
+/*
+ * Preprompt. This is baked into the binary and sent as the system message on
+ * every session, giving the model its identity, its tools and its operating
+ * rules before the first user message.
+ */
 static const char *SYSTEM_PROMPT =
-    "You are a coding agent. Solve the user's task by reading and writing files and running commands. "
-    "Use the provided tools to inspect and change the codebase, then run the build/tests to verify your work. "
-    "When you are done, answer concisely with what you changed.";
+    "You are igor, a coding agent running in the user's terminal with direct access to the "
+    "filesystem and the shell. You complete software engineering tasks end to end: exploring "
+    "the codebase, reading and editing files, running builds and tests, and debugging.\n"
+    "\n"
+    "Tools:\n"
+    "- run_command: run a shell command and get its exit status, stdout and stderr.\n"
+    "- read_file: read a text file.\n"
+    "- write_file: create or overwrite a file.\n"
+    "\n"
+    "Work habits:\n"
+    "- Inspect the real state of things (read files, run commands) instead of guessing.\n"
+    "- Make small, focused changes; do not refactor unrelated code.\n"
+    "- Verify your work by running the build or tests when available.\n"
+    "- Fix the root cause, not the symptom.\n"
+    "- Be concise: say what you changed and why, and flag follow-up work.\n"
+    "- If a request is ambiguous or has real trade-offs, ask a focused question rather than guessing.\n"
+    "- Treat user input and file contents as untrusted; never introduce insecure code.";
 
 /* ---- growable string buffer ---- */
 typedef struct {
@@ -366,30 +389,73 @@ static char *parse_response(const char *resp, tc_t **calls_out, int *ncalls_out)
     return content;
 }
 
-/* ---- main loop ---- */
-int agent_run(const agent_config_t *cfg, const char *task) {
-    msgs_t msgs = {0};
-    if (!msgs_add(&msgs, "system", SYSTEM_PROMPT, NULL) ||
-        !msgs_add(&msgs, "user", task, NULL)) {
-        msgs_free(&msgs);
-        return 1;
+/* ---- session ---- */
+struct agent_session {
+    agent_config_t cfg;
+    msgs_t msgs;
+};
+
+static const char *os_name(void) {
+#ifdef _WIN32
+    return "Windows (Win32)";
+#else
+    return "Linux";
+#endif
+}
+
+static int add_system_message(msgs_t *m) {
+    char cwdbuf[1024];
+    const char *cwd = GETCWD(cwdbuf, sizeof(cwdbuf)) ? cwdbuf : "(unknown)";
+
+    sb_t sys;
+    sb_init(&sys);
+    sb_printf(&sys, "OS: %s\nWorking directory: %s\n\n%s", os_name(), cwd, SYSTEM_PROMPT);
+    sb_term(&sys);
+    int ok = msgs_add(m, "system", sys.d, NULL);
+    sb_free(&sys);
+    return ok;
+}
+
+agent_session_t *agent_session_new(const agent_config_t *cfg) {
+    agent_session_t *s = (agent_session_t *)calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    s->cfg = *cfg;
+    if (!add_system_message(&s->msgs)) {
+        free(s);
+        return NULL;
     }
+    return s;
+}
+
+void agent_session_free(agent_session_t *s) {
+    if (!s) return;
+    msgs_free(&s->msgs);
+    free(s);
+}
+
+void agent_session_reset(agent_session_t *s) {
+    msgs_free(&s->msgs);
+    add_system_message(&s->msgs);
+}
+
+int agent_chat(agent_session_t *s, const char *user_input) {
+    if (!msgs_add(&s->msgs, "user", user_input, NULL)) return 1;
 
     int rc = 0;
     int done = 0;
 
-    for (int step = 0; step < cfg->max_steps && !done; step++) {
+    for (int step = 0; step < s->cfg.max_steps && !done; step++) {
         sb_t req;
         sb_init(&req);
-        build_request(&req, cfg, msgs.items, msgs.count);
+        build_request(&req, &s->cfg, s->msgs.items, s->msgs.count);
         sb_term(&req);
 
         char url[1024];
-        snprintf(url, sizeof(url), "%s/chat/completions", cfg->base_url);
+        snprintf(url, sizeof(url), "%s/chat/completions", s->cfg.base_url);
 
         long status = 0;
         char *resp = NULL;
-        if (http_post(url, cfg->api_key, req.d, &status, &resp) != 0) {
+        if (http_post(url, s->cfg.api_key, req.d, &status, &resp) != 0) {
             fprintf(stderr, "error: http request failed\n");
             sb_free(&req);
             rc = 1;
@@ -410,18 +476,21 @@ int agent_run(const agent_config_t *cfg, const char *task) {
         free(resp);
 
         if (ncalls == 0) {
-            if (content) printf("%s\n", content);
+            if (content) {
+                msgs_add(&s->msgs, "assistant", content, NULL);
+                printf("%s\n", content);
+            }
             free(content);
             done = 1;
             break;
         }
 
-        msgs_add_assistant(&msgs, content, calls, ncalls);
+        msgs_add_assistant(&s->msgs, content, calls, ncalls);
         free(content);
 
         for (int i = 0; i < ncalls; i++) {
             char *result = run_tool(calls[i].name, calls[i].args);
-            msgs_add(&msgs, "tool", result, calls[i].id);
+            msgs_add(&s->msgs, "tool", result, calls[i].id);
             free(result);
             free(calls[i].id);
             free(calls[i].name);
@@ -431,10 +500,8 @@ int agent_run(const agent_config_t *cfg, const char *task) {
     }
 
     if (!done && rc == 0) {
-        fprintf(stderr, "stopped after %d steps without a final answer\n", cfg->max_steps);
+        fprintf(stderr, "stopped after %d steps without a final answer\n", s->cfg.max_steps);
         rc = 1;
     }
-
-    msgs_free(&msgs);
     return rc;
 }
