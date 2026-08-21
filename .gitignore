@@ -1,5 +1,5 @@
-.zig-cache/
-zig-out/
+igor
+igor.exe
 
 # local ISO packaging script (contains demo credentials)
 build_iso.sh
