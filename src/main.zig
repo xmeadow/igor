@@ -1,71 +1,75 @@
 const std = @import("std");
-const Io = std.Io;
+const llm = @import("llm.zig");
+const tools = @import("tools.zig");
 
-const igor = @import("igor");
+const SYSTEM_PROMPT =
+    "You are a coding agent. Solve the user's task by reading and writing files and running commands. " ++
+    "Use the provided tools to inspect and change the codebase, then run the build/tests to verify your work. " ++
+    "When you are done, answer concisely with what you changed.";
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    const gpa = init.gpa;
+    const io = init.io;
+    const arena = init.arena.allocator();
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+    const cfg = llm.Config{
+        .api_key = init.environ_map.get("LLM_API_KEY") orelse {
+            std.debug.print("error: LLM_API_KEY is not set\n", .{});
+            return error.MissingApiKey;
+        },
+        .base_url = init.environ_map.get("LLM_BASE_URL") orelse "https://api.openai.com/v1",
+        .model = init.environ_map.get("LLM_MODEL") orelse "gpt-4o-mini",
+    };
 
-    // Accessing command line arguments:
+    const max_steps = std.fmt.parseInt(u32, init.environ_map.get("LLM_MAX_STEPS") orelse "8", 10) catch 8;
+
     const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    const task: []const u8 = if (args.len > 1) args[1] else try readStdin(arena, io);
+
+    var messages: std.ArrayList(llm.Message) = .empty;
+    try messages.append(arena, .{ .role = "system", .content = SYSTEM_PROMPT });
+    try messages.append(arena, .{ .role = "user", .content = task });
+
+    var steps: u32 = 0;
+    while (steps < max_steps) : (steps += 1) {
+        const resp = try llm.chat(gpa, io, arena, cfg, messages.items, tools.DEFINITIONS_JSON);
+
+        if (resp.tool_calls.len == 0) {
+            const final = try std.fmt.allocPrint(arena, "{s}\n", .{resp.content orelse ""});
+            try writeStdout(io, final);
+            return;
+        }
+
+        try messages.append(arena, .{
+            .role = "assistant",
+            .content = resp.content,
+            .tool_calls = resp.tool_calls,
+        });
+
+        for (resp.tool_calls) |tc| {
+            const result = try tools.run(gpa, io, arena, tc.name, tc.arguments);
+            try messages.append(arena, .{
+                .role = "tool",
+                .tool_call_id = tc.id,
+                .content = result,
+            });
+        }
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
-
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try igor.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
+    std.debug.print("stopped after {d} steps without a final answer\n", .{max_steps});
+    return error.MaxStepsReached;
 }
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+fn readStdin(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
+    var buf: [4096]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io, &buf);
+    return reader.interface.allocRemaining(arena, std.Io.Limit.limited(1024 * 1024));
 }
 
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+fn writeStdout(io: std.Io, bytes: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var file_writer: std.Io.File.Writer = .init(std.Io.File.stdout(), io, &buf);
+    const w = &file_writer.interface;
+    try w.writeAll(bytes);
+    try w.flush();
 }
