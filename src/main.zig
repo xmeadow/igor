@@ -1,7 +1,16 @@
 const std = @import("std");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
+
+/// On Windows, disable `std.debug.SelfInfo`. The default implementation imports
+/// `LdrRegisterDllNotification`/`LdrUnregisterDllNotification` from ntdll.dll,
+/// which ReactOS does not provide, so the binary would otherwise fail to load
+/// at startup. On other targets we keep the default symbolization.
+pub const debug = if (builtin.os.tag == .windows) struct {
+    pub const SelfInfo = void;
+} else struct {};
 
 const SYSTEM_PROMPT =
     "You are a coding agent. Solve the user's task by reading and writing files and running commands. " ++
