@@ -1,8 +1,9 @@
 igor
 igor.exe
 
-# local ISO packaging script (contains demo credentials)
+# local ISO packaging / deploy scripts (contain demo credentials)
 build_iso.sh
+deploy.sh
 
 # ISO output and staging
 *.iso

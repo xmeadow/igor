@@ -63,6 +63,49 @@ static char *ansi_to_utf8(const char *s) {
     return out ? out : strdup(s);
 }
 
+/* Is s well-formed UTF-8 with at least one non-ASCII byte? */
+static int looks_like_utf8(const char *s) {
+    static const unsigned long min_cp[4] = {0, 0x80, 0x800, 0x10000};
+    const unsigned char *p = (const unsigned char *)s;
+    int non_ascii = 0;
+
+    while (*p) {
+        unsigned char c = *p;
+        int extra;
+        unsigned long cp;
+
+        if (c < 0x80) { p++; continue; }
+        non_ascii = 1;
+
+        if ((c & 0xE0) == 0xC0)      { extra = 1; cp = c & 0x1F; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07; }
+        else return 0;
+
+        for (int i = 0; i < extra; i++) {
+            if ((p[1] & 0xC0) != 0x80) return 0;
+            cp = (cp << 6) | (unsigned long)(p[1] & 0x3F);
+            p++;
+        }
+        p++;
+
+        if (cp < min_cp[extra] || cp > 0x10FFFFUL) return 0;
+        if (cp >= 0xD800UL && cp <= 0xDFFFUL) return 0;
+    }
+    return non_ascii;
+}
+
+/* Command-line arguments arrive as ANSI (CP_ACP), which is right when the
+ * user types at the console. When igor is driven from a UTF-8 environment
+ * (ssh, a UTF-8 shell) the bytes are already UTF-8, and re-decoding them as
+ * CP_ACP would double-encode every umlaut. Prefer UTF-8 when the bytes are
+ * well-formed, fall back to CP_ACP otherwise.
+ */
+static char *arg_to_utf8(const char *s) {
+    if (looks_like_utf8(s)) return strdup(s);
+    return ansi_to_utf8(s);
+}
+
 static char *read_line_utf8(FILE *f) {
     (void)f;
     HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
@@ -270,12 +313,12 @@ int main(int argc, char **argv) {
     cfg.base_url = env_or("LLM_BASE_URL", LLM_BASE_URL);
     cfg.model = env_or("LLM_MODEL", LLM_MODEL);
     const char *ms = getenv("LLM_MAX_STEPS");
-    cfg.max_steps = (ms && *ms) ? atoi(ms) : 8;
-    if (cfg.max_steps <= 0) cfg.max_steps = 8;
+    cfg.max_steps = (ms && *ms) ? atoi(ms) : 16;
+    if (cfg.max_steps <= 0) cfg.max_steps = 16;
 
     if (argc > 1) {
 #ifdef _WIN32
-        char *task = ansi_to_utf8(argv[1]);
+        char *task = arg_to_utf8(argv[1]);
         int rc = run_once(&cfg, task);
         free(task);
         return rc;

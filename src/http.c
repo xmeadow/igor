@@ -70,6 +70,10 @@ static int post_winhttp(const char *host, int port, const char *path,
                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hs) return -1;
 
+    /* Bound every step. Without this a stalled connection (ReactOS' winhttp
+     * has no useful default) would hang the agent forever. */
+    WinHttpSetTimeouts(hs, 10000, 10000, 30000, 120000);
+
     WCHAR *whost = to_wide(host);
     WCHAR *wpath = to_wide(path);
     if (!whost || !wpath) { free(whost); free(wpath); WinHttpCloseHandle(hs); return -1; }
@@ -88,10 +92,32 @@ static int post_winhttp(const char *host, int port, const char *path,
     WCHAR *wheaders = to_wide(headers8);
 
     DWORD bodylen = (DWORD)strlen(body);
+
+    /* Hand the body over in small pieces instead of in one go. ReactOS'
+     * winhttp asserts when a socket send reports fewer bytes than requested
+     * (dll/win32/winhttp/net.c, sock_send) and aborts the process. A single
+     * large write right after the TLS handshake is exactly that case: the
+     * peer's usable window is still small, so the send comes back partial.
+     * WinHttpWriteData pushes each call as its own socket write, keeping every
+     * individual send well inside the window. */
+    enum { UPLOAD_CHUNK = 4096 };
     BOOL ok = WinHttpSendRequest(hr,
                                  wheaders ? wheaders : WINHTTP_NO_ADDITIONAL_HEADERS,
                                  wheaders ? (DWORD)-1 : 0,
-                                 (LPVOID)body, bodylen, bodylen, 0);
+                                 NULL, 0, bodylen, 0);
+    if (ok) {
+        DWORD off = 0;
+        while (off < bodylen) {
+            DWORD n = bodylen - off;
+            if (n > UPLOAD_CHUNK) n = UPLOAD_CHUNK;
+            DWORD written = 0;
+            if (!WinHttpWriteData(hr, body + off, n, &written) || !written) {
+                ok = FALSE;
+                break;
+            }
+            off += written;
+        }
+    }
     if (!ok || !WinHttpReceiveResponse(hr, NULL)) {
         free(wheaders); WinHttpCloseHandle(hr); WinHttpCloseHandle(hc);
         free(whost); free(wpath); WinHttpCloseHandle(hs); return -1;
