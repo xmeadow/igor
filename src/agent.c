@@ -14,6 +14,7 @@
 #ifdef _WIN32
 #include <direct.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #define POPEN _popen
 #define PCLOSE _pclose
 #define GETCWD _getcwd
@@ -30,7 +31,7 @@
 static const char *TOOLS_JSON =
     "["
     "{\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"description\":\"Run a shell command and return its exit status and output. Use this to compile, run tests, or inspect the environment.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}}},"
-    "{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"description\":\"Read a UTF-8 text file and return its contents.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}},"
+    "{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"description\":\"Read a text file, or a byte range of any file. Binary content is returned as a hex dump with absolute offsets.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"first byte to read, defaults to 0\"},\"limit\":{\"type\":\"integer\",\"description\":\"how many bytes to read\"}},\"required\":[\"path\"]}}},"
     "{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"Create or overwrite a file with the given contents.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}}"
     "]";
 
@@ -54,6 +55,9 @@ static const char *SYSTEM_PROMPT =
     "- Make small, focused changes; do not refactor unrelated code.\n"
     "- Verify your work by running the build or tests when available.\n"
     "- Fix the root cause, not the symptom.\n"
+    "- Stop when the task is done: once you have what was asked for, write it up rather than"
+    " verifying further. If two approaches to the same sub-problem fail, say what is missing and"
+    " report what you did establish, instead of trying more variants until the step budget is gone.\n"
     "- Be concise: say what you changed and why, and flag follow-up work.\n"
     "- If a request is ambiguous or has real trade-offs, ask a focused question rather than guessing.\n"
     "- Use the correct shell for the system (see the Shell field); on Windows that is cmd.exe, not PowerShell.\n"
@@ -273,7 +277,16 @@ static void build_request(sb_t *b, const agent_config_t *cfg, msg_t *msgs, int n
  * a complete buffer, never on a chunk, or a multi-byte sequence split across
  * the chunk boundary would be misread.
  */
+
+/* Files are treated as binary when they contain a NUL byte - the same rule
+ * git uses. Text stays text even when it is not valid UTF-8, because
+ * sb_append_utf8 repairs that below. */
+static int looks_binary(const char *s, size_t len) {
+    return memchr(s, 0, len) != NULL;
+}
+
 #ifdef _WIN32
+/* Length of the well-formed UTF-8 sequence at p, or 0 if there is none. */
 static int utf8_seq_len(const unsigned char *p, size_t avail) {
     static const unsigned long min_cp[4] = {0, 0x80, 0x800, 0x10000};
     unsigned char c = p[0];
@@ -321,6 +334,32 @@ static void sb_append_utf8(sb_t *b, const char *s, size_t len) {
 }
 #endif
 
+/* How much of a binary file a hex dump shows. Reading one is the only way to
+ * look at bytes here: neither the target platform nor POSIX guarantees xxd,
+ * od or hexdump. */
+#define DUMP_MAX 2048
+
+static void sb_put_hex_dump(sb_t *b, const char *s, size_t len, long base) {
+    size_t i, j, shown = len < DUMP_MAX ? len : DUMP_MAX;
+
+    for (i = 0; i < shown; i += 16) {
+        sb_printf(b, "%08lx  ", (unsigned long)(base + (long)i));
+        for (j = 0; j < 16; j++) {
+            if (i + j < shown) sb_printf(b, "%02x ", (unsigned char)s[i + j]);
+            else sb_puts(b, "   ");
+        }
+        sb_putc(b, ' ');
+        for (j = 0; j < 16 && i + j < shown; j++) {
+            unsigned char c = (unsigned char)s[i + j];
+            sb_putc(b, (c >= 0x20 && c < 0x7f) ? (char)c : '.');
+        }
+        sb_putc(b, '\n');
+    }
+    if (shown < len)
+        sb_printf(b, "... stopped after %lu bytes; ask for another offset to see more\n",
+                  (unsigned long)shown);
+}
+
 /* ---- tools ---- */
 
 #ifdef _WIN32
@@ -329,13 +368,110 @@ static void sb_append_utf8(sb_t *b, const char *s, size_t len) {
  * process holding igor.exe. */
 #define COMMAND_TIMEOUT_MS 120000
 
+/* Command timeout: a command that never returns (a script waiting on a dead
+ * network call, say) would otherwise hang the agent for good and leave a
+ * process holding igor.exe. Override with IGOR_COMMAND_TIMEOUT (seconds). */
+#define COMMAND_TIMEOUT_MS 120000
+
+static int command_timeout_ms(void) {
+    const char *v = getenv("IGOR_COMMAND_TIMEOUT");
+    if (v && *v) {
+        int secs = atoi(v);
+        if (secs > 0) return secs * 1000;
+    }
+    return COMMAND_TIMEOUT_MS;
+}
+
+/* Terminate everything below pid: children, grandchildren, and so on. Needed
+ * where job objects do not exist - ReactOS' AssignProcessToJobObject returns
+ * ERROR_INVALID_FUNCTION - so terminating cmd.exe alone would leave the
+ * command it launched running. */
+#define KILL_TREE_MAX 64
+
+static void kill_process_tree(DWORD pid) {
+    DWORD victims[KILL_TREE_MAX];
+    int n = 1, i, pass, added;
+
+    victims[0] = pid;
+    for (pass = 0; pass < 4; pass++) {
+        HANDLE snap;
+        PROCESSENTRY32 pe;
+
+        added = 0;
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) break;
+        pe.dwSize = sizeof(pe);
+        if (Process32First(snap, &pe)) {
+            do {
+                for (i = 0; i < n; i++)
+                    if (pe.th32ParentProcessID == victims[i]) break;
+                if (i == n) continue; /* not a descendant */
+                for (i = 0; i < n; i++)
+                    if (pe.th32ProcessID == victims[i]) break;
+                if (i < n || n >= KILL_TREE_MAX) continue; /* already collected */
+                victims[n++] = pe.th32ProcessID;
+                added = 1;
+            } while (Process32Next(snap, &pe));
+        }
+        CloseHandle(snap);
+        if (!added) break;
+    }
+
+    for (i = 0; i < n; i++) {
+        HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, victims[i]);
+        if (h) {
+            TerminateProcess(h, 1);
+            CloseHandle(h);
+        }
+    }
+}
+
+/* A job object so that killing an overrunning command takes its whole process
+ * tree with it. Works on Windows; on ReactOS every step may fail, which
+ * kill_process_tree above then covers. */
+static void note_job_unavailable(const char *step);
+
+static HANDLE create_job(void) {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+
+    if (!job) {
+        note_job_unavailable("CreateJobObject");
+        return NULL;
+    }
+    memset(&info, 0, sizeof(info));
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, sizeof(info)))
+        note_job_unavailable("SetInformationJobObject");
+    return job;
+}
+
+static void note_job_unavailable(const char *step) {
+    static int reported = 0;
+    if (reported) return;
+    reported = 1;
+    fprintf(stderr, "  -- job objects unavailable here (%s: error %lu); "
+                    "killing timed-out command trees by hand\n",
+            step, (unsigned long)GetLastError());
+}
+
+/* End the command, and everything it spawned. */
+static void kill_child(HANDLE job, HANDLE process, DWORD pid) {
+    if (job) {
+        TerminateJobObject(job, 1);
+        return;
+    }
+    TerminateProcess(process, 1);
+    kill_process_tree(pid);
+}
+
 /* Run cmd through cmd.exe, capturing stdout+stderr. Returns 0 when the
  * process could not be started; otherwise fills *exit_code and *timed_out. */
 static int run_child(const char *cmd, int timeout_ms, int *exit_code, int *timed_out, sb_t *out) {
     SECURITY_ATTRIBUTES sa;
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
-    HANDLE rd = NULL, wr = NULL;
+    HANDLE rd = NULL, wr = NULL, job = NULL;
     const char *comspec = getenv("ComSpec");
     char tmp[4096], *cl;
     DWORD start, avail, got, code = 0;
@@ -374,6 +510,13 @@ static int run_child(const char *cmd, int timeout_ms, int *exit_code, int *timed
     free(cl);
     CloseHandle(wr);
 
+    job = create_job();
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+        note_job_unavailable("AssignProcessToJobObject");
+        CloseHandle(job);
+        job = NULL;
+    }
+
     start = GetTickCount();
     while (!stop) {
         avail = 0;
@@ -387,13 +530,13 @@ static int run_child(const char *cmd, int timeout_ms, int *exit_code, int *timed
         }
         if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
         if (out->len > MAX_READ) {
-            TerminateProcess(pi.hProcess, 1);
+            kill_child(job, pi.hProcess, pi.dwProcessId);
             stop = 1;
             break;
         }
         if (GetTickCount() - start >= (DWORD)timeout_ms) {
             *timed_out = 1;
-            TerminateProcess(pi.hProcess, 1);
+            kill_child(job, pi.hProcess, pi.dwProcessId);
             stop = 1;
             break;
         }
@@ -415,6 +558,7 @@ static int run_child(const char *cmd, int timeout_ms, int *exit_code, int *timed
     CloseHandle(rd);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    if (job) CloseHandle(job);
     return 1;
 }
 #endif /* _WIN32 */
@@ -438,18 +582,18 @@ static char *tool_run_command(const char *command) {
 
 #ifdef _WIN32
     sb_t raw, r;
-    int code = -1, timed_out = 0;
+    int code = -1, timed_out = 0, timeout_ms = command_timeout_ms();
 
     sb_init(&raw);
-    if (!run_child(cmd, COMMAND_TIMEOUT_MS, &code, &timed_out, &raw)) {
+    if (!run_child(cmd, timeout_ms, &code, &timed_out, &raw)) {
         sb_free(&raw);
         return strdup("run_command: could not start the command");
     }
 
     sb_init(&r);
     if (timed_out)
-        sb_printf(&r, "STATUS: killed after %d ms, the command did not finish\n--- OUTPUT ---\n",
-                  COMMAND_TIMEOUT_MS);
+        sb_printf(&r, "STATUS: killed after %d s, the command did not finish\n--- OUTPUT ---\n",
+                  timeout_ms / 1000);
     else
         sb_printf(&r, "STATUS: exit code %d\n--- OUTPUT ---\n", code);
     sb_append_utf8(&r, raw.d, raw.len);
@@ -481,23 +625,49 @@ static char *tool_run_command(const char *command) {
 #endif
 }
 
-static char *tool_read_file(const char *path) {
+/* Read a file, optionally a byte range. Binary content (a NUL byte) comes
+ * back as a hex dump with absolute offsets, so the model can walk a file it
+ * cannot otherwise inspect. */
+static char *tool_read_file(const char *path, long offset, long limit) {
     FILE *f = fopen(path, "rb");
     if (!f) return strdup("read_file: could not open file");
+
+    long size = 0;
+    if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+    if (offset < 0) offset = 0;
+    if (offset > size) offset = size;
+    if (limit <= 0 || limit > MAX_READ) limit = MAX_READ;
+    if (fseek(f, offset, SEEK_SET) != 0) {
+        fclose(f);
+        return strdup("read_file: could not seek there");
+    }
 
     sb_t out;
     sb_init(&out);
     char tmp[1024];
     size_t n;
-    while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0) {
-        if (out.len + n > MAX_READ) break;
+    long left = limit;
+    while (left > 0) {
+        size_t want = sizeof(tmp);
+        if ((long)want > left) want = (size_t)left;
+        if ((n = fread(tmp, 1, want, f)) == 0) break;
         sb_append_n(&out, tmp, n);
+        left -= (long)n;
     }
     fclose(f);
 
     sb_t r;
     sb_init(&r);
-    sb_append_utf8(&r, out.d, out.len);
+    if (looks_binary(out.d, out.len)) {
+        sb_printf(&r, "read_file: %s is %ld bytes, binary, here from offset %ld\n",
+                  path, size, offset);
+        sb_put_hex_dump(&r, out.d, out.len, offset);
+    } else {
+        if (offset || (long)out.len < size)
+            sb_printf(&r, "read_file: bytes %ld..%ld of %ld\n",
+                      offset, offset + (long)out.len, size);
+        sb_append_utf8(&r, out.d, out.len);
+    }
     sb_free(&out);
     sb_term(&r);
     return r.d;
@@ -540,7 +710,9 @@ static char *run_tool(const char *name, const char *args_json) {
         result = c ? tool_run_command(c) : strdup("run_command: missing 'command'");
     } else if (strcmp(name, "read_file") == 0) {
         const char *p = json_str(json_get(args, "path"));
-        result = p ? tool_read_file(p) : strdup("read_file: missing 'path'");
+        long offset = (long)json_num(json_get(args, "offset"), 0);
+        long limit = (long)json_num(json_get(args, "limit"), 0);
+        result = p ? tool_read_file(p, offset, limit) : strdup("read_file: missing 'path'");
     } else if (strcmp(name, "write_file") == 0) {
         const char *p = json_str(json_get(args, "path"));
         const char *c = json_str(json_get(args, "content"));

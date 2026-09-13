@@ -19,6 +19,10 @@ No external libraries to build or vendor:
 | Process spawn | own `CreateProcess` with a timeout on Win32, `popen` on Linux |
 | File I/O      | stdio (`fopen`/`fread`/`fwrite`)                   |
 
+`read_file` takes an optional `offset` and `limit`. Content containing a NUL
+byte comes back as a hex dump with absolute offsets, so the model can inspect
+bytes on a system that has no `xxd`, `od` or `hexdump`.
+
 ## Requirements
 
 - A C11 compiler. Native: `gcc` + OpenSSL dev headers.
@@ -44,6 +48,7 @@ Via environment variables (same on every OS):
 | `LLM_BASE_URL` | `https://api.openai.com/v1`   | Base URL of the OpenAI-compatible API |
 | `LLM_MODEL`    | `gpt-4o-mini`                 | Model name                           |
 | `LLM_MAX_STEPS`| `16`                          | Max agent loop iterations             |
+| `IGOR_COMMAND_TIMEOUT` | `120`                 | Seconds a shell command may run (Win32) |
 
 Defaults can also be baked in at compile time with `make LLM_API_KEY=... LLM_BASE_URL=... LLM_MODEL=...`.
 
@@ -129,8 +134,12 @@ Win32 code works around them:
   with `invalid unicode code point`.
 - **Command arguments are read as UTF-8 when they are well-formed** and as the
   ANSI code page otherwise, so both `cmd.exe` typing and an ssh client work.
-- **Commands time out after 120 s** and are killed. `_popen` cannot be
-  interrupted, and a hanging script blocked the agent and held `igor.exe`.
+- **Commands time out after 120 s** (override with `IGOR_COMMAND_TIMEOUT`) and are
+  killed. `_popen` cannot be interrupted, and a hanging script blocked the agent
+  and held `igor.exe`.
+- **Killing a command takes its process tree.** Windows gets a job object;
+  ReactOS returns `ERROR_INVALID_FUNCTION` from `AssignProcessToJobObject`, so
+  there the tree is walked with Toolhelp and terminated by hand.
 - **`PATH` is fixed for tool calls.** ReactOS ships a `PATH` pointing at a
   non-existent `C:\Windows`, so no system tool is reachable by bare name; igor
   prepends `%SystemRoot%\system32;%SystemRoot%`.

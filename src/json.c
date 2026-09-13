@@ -309,6 +309,11 @@ const char *json_str(const json_value_t *v) {
     return v->str;
 }
 
+double json_num(const json_value_t *v, double def) {
+    if (!v || v->type != JSON_NUMBER) return def;
+    return v->num;
+}
+
 json_value_t *json_path(const json_value_t *root, const char *path) {
     const json_value_t *cur = root;
     const char *p = path;

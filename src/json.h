@@ -32,6 +32,9 @@ const char *json_str(const json_value_t *v);
 /* Navigate a dotted path such as "choices.0.message.content". */
 json_value_t *json_path(const json_value_t *root, const char *path);
 
+/* Numeric value of a JSON_NUMBER, or def when missing / not a number. */
+double json_num(const json_value_t *v, double def);
+
 /* Return a malloc'd JSON string literal (quoted + escaped). Caller frees. */
 char *json_quote_alloc(const char *s);
 
