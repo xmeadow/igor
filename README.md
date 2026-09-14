@@ -51,6 +51,8 @@ Via environment variables (same on every OS):
 | `IGOR_COMMAND_TIMEOUT` | `120`                 | Seconds a shell command may run (Win32) |
 | `LLM_STREAM`   | `1`                           | Show the answer while it is being written |
 | `IGOR_SHOW_THINKING` | `0`                     | Print the model's reasoning, dimmed, instead of only ticking it in the status line |
+| `IGOR_CONTEXT_TOKENS` | `32000`               | Ceiling for one request, in tokens; older turns are dropped to stay under it |
+| `IGOR_HISTORY` | `.igor/history.jsonl`         | Where an interactive session is kept; a path, or `off` to keep nothing |
 
 Defaults can also be baked in at compile time with `make LLM_API_KEY=... LLM_BASE_URL=... LLM_MODEL=...`.
 
@@ -67,8 +69,10 @@ Defaults can also be baked in at compile time with `make LLM_API_KEY=... LLM_BAS
 echo "find the bug in main.c and fix it" | ./igor
 ```
 
-In interactive mode the conversation history is kept across turns. Slash
-commands: `/help`, `/clear` (reset history), `/exit` (quit).
+In interactive mode the conversation history is kept across turns and written to
+disk, so a restart continues where you left off. Slash commands: `/help`,
+`/clear` (forget the conversation and remove the file), `/exit` (quit). See
+[The conversation](#the-conversation).
 
 ### Other OpenAI-compatible providers
 
@@ -151,6 +155,62 @@ The answer is requested with `stream: true` and printed as it arrives, so a
 long answer does not look like a hang. `LLM_STREAM=0` turns that off. If a
 server ignores `stream` and answers with a plain JSON document, igor notices and
 reads it the ordinary way.
+
+## The conversation
+
+An interactive session is kept in `.igor/history.jsonl` - beside the project's
+skills - so `/exit` or a crash does not throw the chat away. The next start says
+what it found:
+
+```
+  -- resumed 6 messages from .igor/history.jsonl
+```
+
+`IGOR_HISTORY` names a different file (to keep several conversations apart, or
+to give a scripted run a memory) and takes `off`, `none`, `-` or `0` to keep
+nothing. A one-shot task keeps nothing unless `IGOR_HISTORY` says otherwise,
+because it has nothing to come back to.
+
+Only what the model needs to carry on is written: the user's messages and the
+assistant's text. Tool calls and their output are left out on purpose - they are
+the bulk of a long session, worth little the next day, and every one of them
+would be paid for again on every request. Each turn is one record, so the file
+reads like a transcript.
+
+### Staying inside the window
+
+Every request carries the whole conversation, so a session that never forgets
+gets slower and dearer on every step and finally hits the model's window.
+`IGOR_CONTEXT_TOKENS` (default 32000) is the ceiling for one request. Above it,
+igor drops the oldest turns - whole turns at a time, so a tool call never loses
+the result it belongs to - until the rest fits. The system message and the
+newest turn always stay. A drop is reported rather than silent:
+
+```
+  -- 4 older messages dropped to stay under 32000 tokens
+```
+
+There is no tokenizer here. The count starts from a rough three-characters-per-
+token estimate and is corrected against the `usage` the API reports with every
+answer, so the budget keeps meaning tokens whatever the text is made of. For a
+model with a bigger window, `IGOR_CONTEXT_TOKENS` is the one knob to turn.
+
+What no budget can fix: a single message larger than it. A prompt that is mostly
+preprompt and tool definitions has nothing left to drop, and one file read can
+be big enough on its own.
+
+### What a request cost
+
+When the server reports it, every step says what it was billed. These numbers
+are the API's, not an estimate:
+
+```
+  -- tokens: 1704 in, 2 out (session 4820 in, 117 out)
+```
+
+A streaming answer needs `stream_options.include_usage` for that. A server that
+does not know the field is retried once without it, rather than leaving you with
+a client that breaks on a working endpoint.
 
 ## How it works
 

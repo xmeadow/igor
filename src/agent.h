@@ -27,6 +27,13 @@ typedef struct {
     int stream;
     /* Show the model's reasoning, dimmed, instead of hiding it. */
     int show_thought;
+    /* Ceiling for one request - prompt plus answer - in tokens. The oldest
+     * turns are dropped to stay under it. 0 turns trimming off. */
+    long context_tokens;
+    /* Where the conversation is written between turns, or NULL to keep it in
+     * memory only. Set for interactive sessions: a one-shot task has nothing
+     * to come back to. */
+    const char *history_path;
 } agent_config_t;
 
 /* Opaque conversation session; keeps the message history across turns. */

@@ -45,6 +45,17 @@ static int stdout_tty;
 #define LLM_MODEL "gpt-4o-mini"
 #endif
 
+/* Where an interactive session keeps its conversation, relative to the working
+ * directory - the same place the project's skills live. */
+#define HISTORY_FILE ".igor/history.jsonl"
+
+/* Ceiling for one request, in tokens. DeepSeek reports its model windows in the
+ * tens of thousands, so this sits well inside every model igor is likely to be
+ * pointed at, and it keeps the cost of a long session from climbing on every
+ * step. Raise it for a model with a bigger window; igor trims to whatever this
+ * says. */
+#define DEFAULT_CONTEXT_TOKENS 32000
+
 static const char *env_or(const char *name, const char *def) {
     const char *v = getenv(name);
     return (v && *v) ? v : def;
@@ -56,6 +67,14 @@ static int env_on(const char *name, int def) {
     const char *v = getenv(name);
     if (!v || !*v) return def;
     return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
+}
+
+/* For a setting that otherwise names a path: exactly these turn it off, and
+ * anything else is a path. Compared whole, so a file called notes.jsonl is not
+ * mistaken for "no". */
+static int value_off(const char *v) {
+    return strcmp(v, "off") == 0 || strcmp(v, "none") == 0 ||
+           strcmp(v, "-") == 0 || strcmp(v, "0") == 0;
 }
 
 /* ---- UTF-8 aware console I/O ----
@@ -384,7 +403,7 @@ static void trim(char *s) {
 static void print_help(void) {
     out_puts("Commands:\n"
              "  /help    show this help\n"
-             "  /clear   clear the conversation history\n"
+             "  /clear   forget the conversation, history file included\n"
              "  /exit    quit (also /quit or 'exit')\n"
              "\n"
              "Anything else is sent to the agent.\n");
@@ -467,6 +486,7 @@ static int interactive_loop(const agent_config_t *cfg) {
 
 int main(int argc, char **argv) {
     agent_config_t cfg;
+    int history_off = 0;
 #ifdef _WIN32
     {
         CONSOLE_SCREEN_BUFFER_INFO info;
@@ -499,6 +519,25 @@ int main(int argc, char **argv) {
     /* Off by default: shown in full, the reasoning buries the answer. It is
      * still reachable for debugging with IGOR_SHOW_THINKING=1. */
     cfg.show_thought = env_on("IGOR_SHOW_THINKING", 0);
+    cfg.context_tokens = DEFAULT_CONTEXT_TOKENS;
+    cfg.history_path = NULL;
+    {
+        const char *v = getenv("IGOR_CONTEXT_TOKENS");
+        if (v && *v) {
+            long n = atol(v);
+            if (n > 0) cfg.context_tokens = n;
+        }
+    }
+
+    /* Where the conversation is kept. IGOR_HISTORY names a file - useful for
+     * scripted runs and for keeping several conversations apart - or turns
+     * persistence off with off/none/-/0. Left unset, an interactive session
+     * keeps one and a one-shot task keeps nothing. */
+    {
+        const char *v = getenv("IGOR_HISTORY");
+        history_off = (v && *v) ? value_off(v) : 0;
+        if (v && *v && !history_off) cfg.history_path = v;
+    }
     const char *ms = getenv("LLM_MAX_STEPS");
     cfg.max_steps = (ms && *ms) ? atoi(ms) : 16;
     if (cfg.max_steps <= 0) cfg.max_steps = 16;
@@ -515,6 +554,10 @@ int main(int argc, char **argv) {
     }
 
     if (stdin_is_tty()) {
+        /* A chat that is gone when the process exits is not a chat, so an
+         * interactive session keeps one unless told otherwise. A one-shot task
+         * has nothing to come back to. */
+        if (!cfg.history_path && !history_off) cfg.history_path = HISTORY_FILE;
         return interactive_loop(&cfg);
     }
 

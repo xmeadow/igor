@@ -200,6 +200,7 @@ static void sb_keep_tail(sb_t *b, size_t keep) {
 static void sb_append_status_text(sb_t *b, const char *s) {
     for (; *s; s++) sb_putc(b, (*s == '\n' || *s == '\r' || *s == '\t') ? ' ' : *s);
     sb_keep_tail(b, 96);
+    sb_term(b); /* the status line reads it as a C string */
 }
 
 /* ---- message list ---- */
@@ -256,26 +257,73 @@ static int msgs_add_assistant(msgs_t *m, const char *content, tc_t *calls, int n
     return 1;
 }
 
-static void msgs_free(msgs_t *m) {
-    for (int i = 0; i < m->count; i++) {
-        msg_t *x = &m->items[i];
-        free(x->role);
-        free(x->content);
-        free(x->tool_call_id);
-        for (int j = 0; j < x->ncalls; j++) {
-            free(x->calls[j].id);
-            free(x->calls[j].name);
-            free(x->calls[j].args);
-        }
-        free(x->calls);
+static void msg_free(msg_t *x) {
+    free(x->role);
+    free(x->content);
+    free(x->tool_call_id);
+    for (int j = 0; j < x->ncalls; j++) {
+        free(x->calls[j].id);
+        free(x->calls[j].name);
+        free(x->calls[j].args);
     }
+    free(x->calls);
+    memset(x, 0, sizeof(*x));
+}
+
+static void msgs_free(msgs_t *m) {
+    for (int i = 0; i < m->count; i++) msg_free(&m->items[i]);
     free(m->items);
     m->items = NULL;
     m->count = m->cap = 0;
 }
 
+/* Drop n messages from index at, closing the gap. */
+static void msgs_drop_range(msgs_t *m, int at, int n) {
+    if (at < 0 || n <= 0 || at + n > m->count) return;
+    for (int i = at; i < at + n; i++) msg_free(&m->items[i]);
+    memmove(&m->items[at], &m->items[at + n],
+            (size_t)(m->count - at - n) * sizeof(msg_t));
+    m->count -= n;
+}
+
+/* ---- token accounting ----
+ *
+ * There is no tokenizer here. The count only has to be close enough to keep a
+ * request inside the model's window, and the API reports the true number with
+ * every answer - so the estimate starts from a rough three characters per token
+ * and is then corrected against what was actually billed. That correction is
+ * what makes the budget mean tokens rather than bytes: three characters per
+ * token is right for English prose and badly wrong for CJK or a hex dump.
+ */
+#define EST_CHARS_PER_TOKEN 3
+
+static long text_tokens(size_t bytes) {
+    return (long)(bytes / EST_CHARS_PER_TOKEN) + 1;
+}
+
+/* A message costs its parts plus a little for the JSON around them. */
+static long msg_tokens(const msg_t *m) {
+    long n = 4;
+    if (m->role) n += text_tokens(strlen(m->role));
+    if (m->content) n += text_tokens(strlen(m->content));
+    if (m->tool_call_id) n += text_tokens(strlen(m->tool_call_id));
+    for (int j = 0; j < m->ncalls; j++)
+        n += text_tokens(strlen(m->calls[j].name)) + text_tokens(strlen(m->calls[j].args)) + 4;
+    return n;
+}
+
+/* What a request built from messages from..count will cost, uncorrected. The
+ * tool definitions ride along and are not free. */
+static long request_tokens_raw(const msgs_t *m, int from, int with_tools) {
+    long n = 0;
+    for (int i = from; i < m->count; i++) n += msg_tokens(&m->items[i]);
+    if (with_tools) n += text_tokens(strlen(TOOLS_JSON));
+    return n;
+}
+
 /* ---- request building ---- */
-static void build_request(sb_t *b, const agent_config_t *cfg, msg_t *msgs, int nmsg, int with_tools) {
+static void build_request(sb_t *b, const agent_config_t *cfg, msg_t *msgs, int nmsg,
+                          int with_tools, int include_usage) {
     sb_puts(b, "{\"model\":");
     char *q = json_quote_alloc(cfg->model);
     sb_puts(b, q);
@@ -330,7 +378,12 @@ static void build_request(sb_t *b, const agent_config_t *cfg, msg_t *msgs, int n
         sb_puts(b, ",\"tools\":");
         sb_puts(b, TOOLS_JSON);
     }
-    if (cfg->stream) sb_puts(b, ",\"stream\":true");
+    if (cfg->stream) {
+        sb_puts(b, ",\"stream\":true");
+        /* Without this the stream carries no token count. Some servers do not
+         * know the field; http_turn drops it again if one rejects it. */
+        if (include_usage) sb_puts(b, ",\"stream_options\":{\"include_usage\":true}");
+    }
     sb_putc(b, '}');
 }
 
@@ -784,6 +837,8 @@ typedef struct {
     int thought_line_start; /* the next reasoning byte begins a line */
     long started;     /* when this turn began, for the elapsed time */
     long last_status; /* when the status line was last redrawn */
+    long usage_in, usage_out; /* what the API billed, when it says */
+    int has_usage;
     int done;         /* the stream said [DONE] */
 } stream_t;
 
@@ -800,6 +855,8 @@ static void stream_init(stream_t *st, const agent_config_t *cfg) {
     st->thought_line_start = 1;
     st->started = now_ms();
     st->last_status = 0;
+    st->usage_in = st->usage_out = 0;
+    st->has_usage = 0;
     st->done = 0;
 }
 
@@ -859,6 +916,19 @@ static void stream_event(stream_t *st, const char *json) {
 
     root = json_parse(json);
     if (!root) return;
+
+    /* The count arrives in its own final event, with no choices in it. */
+    {
+        json_value_t *u = json_get(root, "usage");
+        if (u && u->type == JSON_OBJECT) {
+            long in = (long)json_num(json_get(u, "prompt_tokens"), 0);
+            if (in > 0) {
+                st->usage_in = in;
+                st->usage_out = (long)json_num(json_get(u, "completion_tokens"), 0);
+                st->has_usage = 1;
+            }
+        }
+    }
 
     delta = json_path(root, "choices.0.delta");
     if (delta) {
@@ -976,7 +1046,12 @@ static void stream_result(stream_t *st, char **content_out, tc_t **calls_out, in
 
     *calls_out = calls;
     *ncalls_out = n;
-    *content_out = st->content.len ? strdup(st->content.d) : NULL;
+    if (st->content.len) {
+        sb_term(&st->content); /* sb_puts does not terminate the buffer */
+        *content_out = strdup(st->content.d);
+    } else {
+        *content_out = NULL;
+    }
 }
 
 /* ---- grep ----
@@ -1400,12 +1475,23 @@ static char *run_tool(const agent_config_t *cfg, const char *name, const char *a
 
 /* ---- response parsing ---- */
 /* Returns malloc'd assistant content (may be NULL) and fills *calls_out. */
-static char *parse_response(const char *resp, tc_t **calls_out, int *ncalls_out) {
+static char *parse_response(const char *resp, tc_t **calls_out, int *ncalls_out,
+                            long *usage_in, long *usage_out) {
     *calls_out = NULL;
     *ncalls_out = 0;
+    *usage_in = 0;
+    *usage_out = 0;
 
     json_value_t *root = json_parse(resp);
     if (!root) return NULL;
+
+    {
+        json_value_t *u = json_get(root, "usage");
+        if (u) {
+            *usage_in = (long)json_num(json_get(u, "prompt_tokens"), 0);
+            *usage_out = (long)json_num(json_get(u, "completion_tokens"), 0);
+        }
+    }
 
     char *content = NULL;
     json_value_t *msg = json_path(root, "choices.0.message");
@@ -1442,7 +1528,213 @@ static char *parse_response(const char *resp, tc_t **calls_out, int *ncalls_out)
 struct agent_session {
     agent_config_t cfg;
     msgs_t msgs;
+    double token_scale;  /* correction learned from the API's own counts */
+    long last_estimate;  /* raw estimate of the request last sent */
+    long prompt_tokens;  /* what the API reported, added up over the session */
+    long completion_tokens;
+    int usage_ok;        /* the server accepted stream_options */
+    int save_failed;     /* said so once instead of every turn */
 };
+
+/* ---- history on disk ----
+ *
+ * The conversation is one JSON object per line: json_quote_alloc already knows
+ * how to write a string, so nothing here has to invent an escaping rule, and a
+ * file cut short loses at most its last line. Only what the model needs to
+ * carry on is written - the user's messages and the assistant's text. Tool
+ * calls and their output are left out on purpose: they are the bulk of a long
+ * session, they are worth little the next day, and every one of them would be
+ * paid for again on every following request.
+ */
+
+/* Create the directory a path lives in. Intermediate parts are made too, so an
+ * IGOR_HISTORY of logs/igor/history.jsonl just works. A failure here is not
+ * fatal: the fopen below reports it, once, with the path in the message. */
+static void history_mkdir(const char *path) {
+    char dir[1024];
+    const char *slash = strrchr(path, '/');
+    size_t n, i;
+#ifdef _WIN32
+    const char *bs = strrchr(path, '\\');
+    if (!slash || (bs && bs > slash)) slash = bs;
+#endif
+    if (!slash || (size_t)(slash - path) >= sizeof(dir)) return;
+    n = (size_t)(slash - path);
+    memcpy(dir, path, n);
+    dir[n] = 0;
+
+    for (i = 1; i <= n; i++) {
+        char save;
+        if (dir[i] != '/' && dir[i] != '\\' && dir[i] != 0) continue;
+        save = dir[i];
+        dir[i] = 0;
+        /* A Windows drive letter is not a directory to create. */
+        if (dir[0] && dir[strlen(dir) - 1] != ':') {
+#ifdef _WIN32
+            _mkdir(dir);
+#else
+            mkdir(dir, 0755);
+#endif
+        }
+        dir[i] = save;
+        if (save == 0) break;
+    }
+}
+
+static int history_write_msg(FILE *f, const char *role, const char *content) {
+    char *r = json_quote_alloc(role);
+    char *c = json_quote_alloc(content);
+    int ok;
+    if (!r || !c) {
+        free(r);
+        free(c);
+        return 0;
+    }
+    ok = fprintf(f, "{\"role\":%s,\"content\":%s}\n", r, c) > 0;
+    free(r);
+    free(c);
+    return ok;
+}
+
+static int history_save(const agent_session_t *s) {
+    FILE *f;
+    sb_t pending; /* the assistant's talk for one turn, collected */
+    int ok = 1;
+
+    if (!s->cfg.history_path || !*s->cfg.history_path) return 0;
+    history_mkdir(s->cfg.history_path);
+    f = fopen(s->cfg.history_path, "wb");
+    if (!f) return -1;
+
+    /* The model talks, calls a tool and talks again, and the tool traffic in
+     * between is not kept - so those blocks are one utterance and are written
+     * as one, rather than left as a stutter of assistant messages. */
+    sb_init(&pending);
+    for (int i = 0; i < s->msgs.count && ok; i++) {
+        const msg_t *m = &s->msgs.items[i];
+        if (!m->content || !*m->content) continue; /* a bare tool call is not talk */
+        if (strcmp(m->role, "assistant") == 0) {
+            if (pending.len) sb_puts(&pending, "\n\n");
+            sb_puts(&pending, m->content);
+            continue;
+        }
+        if (strcmp(m->role, "user") != 0) continue;
+        if (pending.len) {
+            sb_term(&pending);
+            ok = history_write_msg(f, "assistant", pending.d);
+            pending.len = 0;
+        }
+        ok = ok && history_write_msg(f, "user", m->content);
+    }
+    if (ok && pending.len) {
+        sb_term(&pending);
+        ok = history_write_msg(f, "assistant", pending.d);
+    }
+    sb_free(&pending);
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+/* One line, however long it is. Returns 0 at end of file. */
+static int read_line(sb_t *b, FILE *f) {
+    int c, any = 0;
+    b->len = 0;
+    while ((c = fgetc(f)) != EOF) {
+        any = 1;
+        if (c == '\n') break;
+        if (c != '\r') sb_putc(b, (char)c);
+    }
+    if (!any) return 0;
+    sb_term(b);
+    return 1;
+}
+
+static int history_load(agent_session_t *s) {
+    FILE *f;
+    sb_t line;
+    int n = 0;
+
+    if (!s->cfg.history_path || !*s->cfg.history_path) return 0;
+    f = fopen(s->cfg.history_path, "rb");
+    if (!f) return 0; /* nothing kept yet */
+
+    sb_init(&line);
+    while (read_line(&line, f)) {
+        json_value_t *o = json_parse(line.d);
+        if (o) {
+            const char *role = json_str(json_get(o, "role"));
+            const char *content = json_str(json_get(o, "content"));
+            if (role && content && *content &&
+                (strcmp(role, "user") == 0 || strcmp(role, "assistant") == 0)) {
+                if (msgs_add(&s->msgs, role, content, NULL)) n++;
+            }
+            json_free(o);
+        }
+    }
+    sb_free(&line);
+    fclose(f);
+    return n;
+}
+
+static void history_clear(const agent_session_t *s) {
+    if (!s->cfg.history_path || !*s->cfg.history_path) return;
+    remove(s->cfg.history_path);
+}
+
+/* ---- staying inside the window ---- */
+
+/* Drop the oldest turns until the request fits. The cut lands on a user
+ * message, so a turn is dropped whole: an assistant message that carries
+ * tool_calls has to keep its tool results, or the API rejects the request. The
+ * system message always stays, and so does the newest turn - dropping that one
+ * would leave nothing to answer, even when it alone is over budget. */
+static void trim_history(agent_session_t *s, int with_tools) {
+    long budget, sum, last_user = -1;
+    int cut = -1;
+
+    if (s->cfg.context_tokens <= 0 || s->msgs.count < 2) return;
+    /* The budget covers prompt and answer together: a long answer is written
+     * out of the same window, so the prompt has to leave it room. The tool
+     * definitions ride along on the prompt and are not free either. */
+    budget = (long)((double)s->cfg.context_tokens * 0.75);
+    if (with_tools) budget -= (long)((double)text_tokens(strlen(TOOLS_JSON)) * s->token_scale);
+
+    /* Start at the system message: it is sent too, and counting only the part
+     * that can be dropped would keep a request over the budget it is meant to
+     * stay under. */
+    sum = msg_tokens(&s->msgs.items[0]);
+    for (int i = s->msgs.count - 1; i >= 1; i--) {
+        sum += msg_tokens(&s->msgs.items[i]);
+        if (strcmp(s->msgs.items[i].role, "user") != 0) continue;
+        if (last_user < 0) last_user = i;
+        if ((long)((double)sum * s->token_scale) <= budget) cut = i;
+        else break; /* anything older only makes the suffix bigger */
+    }
+    if (cut < 0) cut = last_user;
+    if (cut <= 1) return; /* nothing to drop */
+
+    note(&s->cfg, IGOR_NOTE, "  -- %d older message%s dropped to stay under %ld tokens\n",
+         cut - 1, cut - 1 == 1 ? "" : "s", s->cfg.context_tokens);
+    msgs_drop_range(&s->msgs, 1, cut - 1);
+}
+
+/* The API's count is the truth; the estimate only has to be proportional to
+ * it. Learn the ratio, so the budget means tokens whatever the text is made
+ * of - and so the numbers shown to the user are the real ones. */
+static void take_usage(agent_session_t *s, long in, long out) {
+    if (in <= 0) return;
+
+    if (s->last_estimate > 0) {
+        double observed = (double)in / (double)s->last_estimate;
+        if (observed > 0.2 && observed < 8.0) /* ignore a nonsense ratio */
+            s->token_scale = s->token_scale * 0.5 + observed * 0.5;
+    }
+
+    s->prompt_tokens += in;
+    s->completion_tokens += out > 0 ? out : 0;
+    note(&s->cfg, IGOR_NOTE, "  -- tokens: %ld in, %ld out (session %ld in, %ld out)\n",
+         in, out > 0 ? out : 0, s->prompt_tokens, s->completion_tokens);
+}
 
 static const char *os_name(void) {
 #ifdef _WIN32
@@ -1806,9 +2098,17 @@ agent_session_t *agent_session_new(const agent_config_t *cfg) {
     agent_session_t *s = (agent_session_t *)calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->cfg = *cfg;
+    s->token_scale = 1.0;
+    s->usage_ok = 1;
     if (!add_system_message(&s->cfg, &s->msgs)) {
         free(s);
         return NULL;
+    }
+    {
+        int n = history_load(s);
+        if (n > 0)
+            note(&s->cfg, IGOR_NOTE, "  -- resumed %d message%s from %s\n",
+                 n, n == 1 ? "" : "s", s->cfg.history_path);
     }
     return s;
 }
@@ -1821,56 +2121,81 @@ void agent_session_free(agent_session_t *s) {
 
 void agent_session_reset(agent_session_t *s) {
     msgs_free(&s->msgs);
+    history_clear(s);
     add_system_message(&s->cfg, &s->msgs);
 }
 
 /* Drop the newest message again, freeing it. */
 static void msgs_drop_last(msgs_t *m) {
     if (m->count == 0) return;
-    msg_t *x = &m->items[--m->count];
-    free(x->role);
-    free(x->content);
-    free(x->tool_call_id);
-    for (int j = 0; j < x->ncalls; j++) {
-        free(x->calls[j].id);
-        free(x->calls[j].name);
-        free(x->calls[j].args);
-    }
-    free(x->calls);
-    memset(x, 0, sizeof(*x));
+    msg_free(&m->items[m->count - 1]);
+    m->count--;
 }
 
 /* One request/response round. Returns 1 on success and hands back the
  * assistant text plus any tool calls; nothing is written to the history here,
  * the caller decides what to do with the result. The answer reaches cfg->out
  * in the same step, streamed while it is written or once it has arrived. */
-static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
+static int http_turn(agent_session_t *s, int with_tools,
                      char **content_out, tc_t **calls_out, int *ncalls_out) {
+    const agent_config_t *cfg = &s->cfg;
+    msgs_t *msgs = &s->msgs;
     sb_t req;
     char url[1024];
-    long status = 0;
+    long status = 0, usage_in = 0, usage_out = 0;
     char *resp = NULL;
     stream_t st;
     int streaming = cfg->stream;
+    int include_usage = streaming && s->usage_ok;
+    int attempt;
 
     *content_out = NULL;
     *calls_out = NULL;
     *ncalls_out = 0;
 
+    /* Every request goes through here, so this is the one place that has to
+     * hold the line on the window size. */
+    trim_history(s, with_tools);
+
     if (!sb_init(&req)) return 0;
-    build_request(&req, cfg, msgs->items, msgs->count, with_tools);
+    build_request(&req, cfg, msgs->items, msgs->count, with_tools, include_usage);
     sb_term(&req);
 
-    if (streaming) stream_init(&st, cfg);
-    set_status(cfg, "... waiting for the model");
+    /* What this request is expected to cost; the API's answer corrects it. */
+    s->last_estimate = request_tokens_raw(msgs, 0, with_tools);
 
     snprintf(url, sizeof(url), "%s/chat/completions", cfg->base_url);
-    if (http_post(url, cfg->api_key, req.d, &status, &resp,
-                  streaming ? stream_feed : NULL, streaming ? &st : NULL) != 0) {
-        note(cfg, IGOR_ERROR, "error: http request failed\n");
-        sb_free(&req);
-        if (streaming) stream_free(&st);
-        return 0;
+
+    for (attempt = 0; attempt < 2; attempt++) {
+        if (streaming) stream_init(&st, cfg);
+        set_status(cfg, "... waiting for the model");
+
+        if (http_post(url, cfg->api_key, req.d, &status, &resp,
+                      streaming ? stream_feed : NULL, streaming ? &st : NULL) != 0) {
+            note(cfg, IGOR_ERROR, "error: http request failed\n");
+            sb_free(&req);
+            if (streaming) stream_free(&st);
+            return 0;
+        }
+        if (status == 200) break;
+
+        /* Asking for a token count is worth one retry, not a client that breaks
+         * on a server that has never heard of stream_options. */
+        if (streaming && include_usage) {
+            include_usage = 0;
+            s->usage_ok = 0;
+            note(cfg, IGOR_NOTE,
+                 "  -- the server rejected stream_options; retrying without the token count\n");
+            free(resp);
+            resp = NULL;
+            stream_free(&st);
+            sb_free(&req);
+            if (!sb_init(&req)) return 0;
+            build_request(&req, cfg, msgs->items, msgs->count, with_tools, 0);
+            sb_term(&req);
+            continue;
+        }
+        break;
     }
     sb_free(&req);
 
@@ -1884,10 +2209,12 @@ static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
     if (streaming) {
         stream_result(&st, content_out, calls_out, ncalls_out);
         stream_close_thought(&st);
+        usage_in = st.usage_in;
+        usage_out = st.usage_out;
         if (!*content_out && *ncalls_out == 0) {
             /* Nothing that looked like an event: the server ignored stream and
              * sent a plain document. */
-            *content_out = parse_response(resp, calls_out, ncalls_out);
+            *content_out = parse_response(resp, calls_out, ncalls_out, &usage_in, &usage_out);
             if (*content_out && *ncalls_out == 0) say(cfg, IGOR_TEXT, *content_out);
         } else if (*content_out && *ncalls_out == 0 && !st.printed) {
             say(cfg, IGOR_TEXT, *content_out);
@@ -1898,11 +2225,12 @@ static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
         }
         stream_free(&st);
     } else {
-        *content_out = parse_response(resp, calls_out, ncalls_out);
+        *content_out = parse_response(resp, calls_out, ncalls_out, &usage_in, &usage_out);
         if (*content_out && *ncalls_out == 0) say(cfg, IGOR_TEXT, *content_out);
     }
     set_status(cfg, NULL);
     free(resp);
+    take_usage(s, usage_in, usage_out);
     return 1;
 }
 
@@ -1923,7 +2251,7 @@ static char *wrap_up(agent_session_t *s) {
          s->cfg.max_steps);
 
     if (!msgs_add(&s->msgs, "user", ask, NULL)) return NULL;
-    if (http_turn(&s->cfg, &s->msgs, 0, &content, &calls, &ncalls)) {
+    if (http_turn(s, 0, &content, &calls, &ncalls)) {
         if (ncalls == 0) {
             answer = content;
         } else {
@@ -1952,7 +2280,7 @@ char *agent_chat(agent_session_t *s, const char *user_input) {
         tc_t *calls = NULL;
         int ncalls = 0;
 
-        if (!http_turn(&s->cfg, &s->msgs, 1, &content, &calls, &ncalls)) break;
+        if (!http_turn(s, 1, &content, &calls, &ncalls)) break;
 
         if (ncalls == 0) {
             if (content) msgs_add(&s->msgs, "assistant", content, NULL);
@@ -1977,5 +2305,13 @@ char *agent_chat(agent_session_t *s, const char *user_input) {
 
     /* Out of steps rather than an error: end with a summary, never in silence. */
     if (!done && step == s->cfg.max_steps) answer = wrap_up(s);
+
+    /* Written after every turn, so an /exit or a crash costs at most the turn
+     * in flight. Failing to write is not fatal, but it is said out loud once. */
+    if (history_save(s) != 0 && !s->save_failed) {
+        s->save_failed = 1;
+        note(&s->cfg, IGOR_ERROR, "  -- cannot write %s; this conversation is not being kept\n",
+             s->cfg.history_path);
+    }
     return answer;
 }
