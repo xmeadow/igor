@@ -158,6 +158,8 @@ static void out_puts(const char *s) {
     } else {
         fwrite(s, 1, strlen(s), stdout);
     }
+    /* Streamed answers arrive in fragments: flush so each one shows at once. */
+    fflush(stdout);
 }
 
 #else /* POSIX */
@@ -184,6 +186,8 @@ static char *read_line_utf8(FILE *f) {
 
 static void out_puts(const char *s) {
     fputs(s, stdout);
+    /* Streamed answers arrive in fragments: flush so each one shows at once. */
+    fflush(stdout);
 }
 
 #endif /* _WIN32 */
@@ -234,14 +238,13 @@ static int run_once(const agent_config_t *cfg, const char *task) {
     }
     char *ans = agent_chat(s, task);
     agent_session_free(s);
-    if (ans) {
-        out_puts(ans);
-        out_puts("\n");
-        free(ans);
-        fflush(stdout);
-        return 0;
-    }
-    return 1;
+    int rc = ans ? 0 : 1;
+    free(ans);
+    /* The answer itself was already written by the session, either streamed or
+     * once it had arrived. */
+    out_puts("\n");
+    fflush(stdout);
+    return rc;
 }
 
 static int interactive_loop(const agent_config_t *cfg) {
@@ -287,16 +290,14 @@ static int interactive_loop(const agent_config_t *cfg) {
             continue;
         }
 
+        out_puts("igor> ");
+        fflush(stdout);
+
         char *ans = agent_chat(s, line);
         free(line);
-
-        if (ans) {
-            out_puts("igor> ");
-            out_puts(ans);
-            out_puts("\n\n");
-            free(ans);
-            fflush(stdout);
-        }
+        free(ans);
+        out_puts("\n\n");
+        fflush(stdout);
     }
 
     agent_session_free(s);
@@ -312,6 +313,13 @@ int main(int argc, char **argv) {
     }
     cfg.base_url = env_or("LLM_BASE_URL", LLM_BASE_URL);
     cfg.model = env_or("LLM_MODEL", LLM_MODEL);
+    cfg.out = out_puts;
+    cfg.stream = 1;
+    {
+        const char *v = getenv("LLM_STREAM");
+        if (v && *v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N'|| v[0] == 'f' || v[0] == 'F'))
+            cfg.stream = 0;
+    }
     const char *ms = getenv("LLM_MAX_STEPS");
     cfg.max_steps = (ms && *ms) ? atoi(ms) : 16;
     if (cfg.max_steps <= 0) cfg.max_steps = 16;

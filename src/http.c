@@ -52,6 +52,61 @@ static int url_parse(const char *url, char **host, int *port, char **path, int *
     return 0;
 }
 
+/* ---- response body sink ----
+ *
+ * Collects the body while it arrives and hands each piece to the caller's
+ * callback, so a streamed answer can be shown before the response ends.
+ */
+typedef struct {
+    char *body;
+    size_t len, cap;
+    http_chunk_fn on_chunk;
+    void *ctx;
+} sink_t;
+
+static void sink_init(sink_t *s, http_chunk_fn on_chunk, void *ctx) {
+    s->cap = 8192;
+    s->len = 0;
+    s->body = NULL;
+    s->on_chunk = on_chunk;
+    s->ctx = ctx;
+}
+
+/* Room for len more bytes plus the terminator; NULL when out of memory. */
+static char *sink_put(sink_t *s, size_t len) {
+    if (!s->body) {
+        if (len + 1 > s->cap) s->cap = len + 1;
+        s->body = (char *)malloc(s->cap);
+        if (!s->body) return NULL;
+        s->body[0] = 0;
+        return s->body;
+    }
+    if (s->len + len + 1 > s->cap) {
+        size_t ncap = s->cap;
+        char *nb;
+        while (ncap < s->len + len + 1) ncap *= 2;
+        nb = (char *)realloc(s->body, ncap);
+        if (!nb) return NULL;
+        s->body = nb;
+        s->cap = ncap;
+    }
+    return s->body + s->len;
+}
+
+static void sink_commit(sink_t *s, size_t len) {
+    char *written = s->body + s->len;
+    s->len += len;
+    s->body[s->len] = 0;
+    if (len && s->on_chunk) s->on_chunk(s->ctx, written, len);
+}
+
+/* Not for a sink whose body was handed over as *resp. */
+static void sink_free(sink_t *s) {
+    free(s->body);
+    s->body = NULL;
+    s->len = s->cap = 0;
+}
+
 #ifdef _WIN32
 
 static WCHAR *to_wide(const char *s) {
@@ -65,7 +120,8 @@ static WCHAR *to_wide(const char *s) {
 
 static int post_winhttp(const char *host, int port, const char *path,
                         const char *api_key, const char *body,
-                        long *status, char **resp, int tls) {
+                        long *status, char **resp, int tls,
+                        http_chunk_fn on_chunk, void *ctx) {
     HINTERNET hs = WinHttpOpen(L"igor/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hs) return -1;
@@ -119,8 +175,13 @@ static int post_winhttp(const char *host, int port, const char *path,
         }
     }
     if (!ok || !WinHttpReceiveResponse(hr, NULL)) {
-        free(wheaders); WinHttpCloseHandle(hr); WinHttpCloseHandle(hc);
-        free(whost); free(wpath); WinHttpCloseHandle(hs); return -1;
+        free(wheaders);
+        WinHttpCloseHandle(hr);
+        WinHttpCloseHandle(hc);
+        free(whost);
+        free(wpath);
+        WinHttpCloseHandle(hs);
+        return -1;
     }
 
     DWORD sc = 0, scsize = sizeof(sc);
@@ -128,28 +189,32 @@ static int post_winhttp(const char *host, int port, const char *path,
                         WINHTTP_HEADER_NAME_BY_INDEX, &sc, &scsize, WINHTTP_NO_HEADER_INDEX);
     *status = (long)sc;
 
-    size_t cap = 8192, len = 0;
-    char *buf = (char *)malloc(cap);
-    if (!buf) {
-        free(wheaders); WinHttpCloseHandle(hr); WinHttpCloseHandle(hc);
-        free(whost); free(wpath); WinHttpCloseHandle(hs); return -1;
-    }
+    sink_t sink;
+    sink_init(&sink, on_chunk, ctx);
 
     DWORD avail = 0;
     while (WinHttpQueryDataAvailable(hr, &avail) && avail > 0) {
-        if (len + avail + 1 > cap) {
-            while (len + avail + 1 > cap) cap *= 2;
-            char *nb = (char *)realloc(buf, cap);
-            if (!nb) { free(buf); free(wheaders); WinHttpCloseHandle(hr); WinHttpCloseHandle(hc); free(whost); free(wpath); WinHttpCloseHandle(hs); return -1; }
-            buf = nb;
-        }
+        char *dst = sink_put(&sink, avail);
         DWORD rd = 0;
-        if (!WinHttpReadData(hr, buf + len, avail, &rd)) break;
-        len += rd;
+        if (!dst) break;
+        if (!WinHttpReadData(hr, dst, avail, &rd)) break;
+        sink_commit(&sink, rd);
         if (rd == 0) break;
     }
-    buf[len] = 0;
-    *resp = buf;
+    if (!sink.body) {
+        /* An empty body is still a body: the caller parses whatever comes back. */
+        if (!sink_put(&sink, 0)) {
+            sink_free(&sink);
+            free(wheaders);
+            WinHttpCloseHandle(hr);
+            WinHttpCloseHandle(hc);
+            free(whost);
+            free(wpath);
+            WinHttpCloseHandle(hs);
+            return -1;
+        }
+    }
+    *resp = sink.body;
 
     free(wheaders);
     WinHttpCloseHandle(hr);
@@ -161,6 +226,15 @@ static int post_winhttp(const char *host, int port, const char *path,
 }
 
 #else /* POSIX */
+
+/* Collect bytes that have already been received into the sink. */
+static void sink_emit(void *ctx, const char *data, size_t len) {
+    sink_t *s = (sink_t *)ctx;
+    char *dst = sink_put(s, len);
+    if (!dst) return;
+    memcpy(dst, data, len);
+    sink_commit(s, len);
+}
 
 static int header_has(const char *s, const char *end, const char *needle) {
     size_t nl = strlen(needle);
@@ -178,45 +252,62 @@ static int header_has(const char *s, const char *end, const char *needle) {
     return 0;
 }
 
-static char *dechunk(const char *body, size_t len) {
-    size_t cap = len + 1, out_len = 0;
-    char *out = (char *)malloc(cap);
-    if (!out) return NULL;
-    const char *p = body;
-    const char *end = body + len;
-    while (p < end) {
-        size_t sz = 0;
-        while (p < end) {
-            char c = *p;
-            if (c >= '0' && c <= '9') sz = sz * 16 + (size_t)(c - '0');
-            else if (c >= 'a' && c <= 'f') sz = sz * 16 + (size_t)(c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') sz = sz * 16 + (size_t)(c - 'A' + 10);
-            else break;
-            p++;
+static char *find_header_end(char *buf, size_t from, size_t len) {
+    size_t i = from;
+    for (; i + 4 <= len; i++)
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
+            return buf + i;
+    return NULL;
+}
+
+/* Decodes chunked transfer coding as bytes arrive, so a streamed body does not
+ * have to be buffered whole before it can be understood. */
+typedef struct {
+    int state; /* 0 = chunk size line, 1 = chunk data, 2 = CRLF after a chunk */
+    int done;
+    size_t remaining;
+    char line[32];
+    size_t linelen;
+} dechunk_t;
+
+static void dechunk_feed(dechunk_t *st, const char *data, size_t len,
+                         http_chunk_fn emit, void *ctx) {
+    size_t i = 0;
+
+    while (i < len && !st->done) {
+        if (st->state == 1) {
+            size_t take = len - i;
+            if (take > st->remaining) take = st->remaining;
+            if (emit) emit(ctx, data + i, take);
+            i += take;
+            st->remaining -= take;
+            if (st->remaining == 0) st->state = 2;
+            continue;
         }
-        while (p < end && *p != '\n') p++;
-        if (p < end) p++;
-        if (sz == 0) break;
-        if (out_len + sz + 1 > cap) {
-            while (out_len + sz + 1 > cap) cap *= 2;
-            char *nb = (char *)realloc(out, cap);
-            if (!nb) { free(out); return NULL; }
-            out = nb;
+        if (st->state == 2) {
+            if (data[i++] == '\n') st->state = 0;
+            continue;
         }
-        if (p + sz > end) { free(out); return NULL; }
-        memcpy(out + out_len, p, sz);
-        out_len += sz;
-        p += sz;
-        if (p < end && *p == '\r') p++;
-        if (p < end && *p == '\n') p++;
+        /* chunk size line, possibly split across reads */
+        {
+            char c = data[i++];
+            if (c == '\n') {
+                st->line[st->linelen] = 0;
+                st->linelen = 0;
+                st->remaining = (size_t)strtoul(st->line, NULL, 16);
+                st->state = st->remaining ? 1 : 2;
+                if (!st->remaining) st->done = 1; /* the terminating chunk */
+            } else if (c != '\r' && st->linelen < sizeof(st->line) - 1) {
+                st->line[st->linelen++] = c;
+            }
+        }
     }
-    out[out_len] = 0;
-    return out;
 }
 
 static int post_posix(const char *host, int port, const char *path,
                       const char *api_key, const char *body,
-                      long *status, char **resp, int tls) {
+                      long *status, char **resp, int tls,
+                      http_chunk_fn on_chunk, void *cb_ctx) {
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -276,7 +367,7 @@ static int post_posix(const char *host, int port, const char *path,
         return -1;
     }
 
-    size_t cap = 8192, len = 0;
+    size_t cap = 8192, len = 0, searched = 0, body_off = 0, fed = 0;
     char *buf = (char *)malloc(cap);
     if (!buf) {
         if (ssl) SSL_free(ssl);
@@ -284,6 +375,12 @@ static int post_posix(const char *host, int port, const char *path,
         close(fd);
         return -1;
     }
+
+    sink_t sink;
+    dechunk_t dc;
+    int header_done = 0, chunked = 0;
+    sink_init(&sink, on_chunk, cb_ctx);
+    memset(&dc, 0, sizeof(dc));
 
     char tmp[4096];
     ssize_t n;
@@ -293,54 +390,77 @@ static int post_posix(const char *host, int port, const char *path,
         if (len + (size_t)n + 1 > cap) {
             while (len + (size_t)n + 1 > cap) cap *= 2;
             char *nb = (char *)realloc(buf, cap);
-            if (!nb) { free(buf); if (ssl) SSL_free(ssl); if (ctx) SSL_CTX_free(ctx); close(fd); return -1; }
+            if (!nb) { free(buf); sink_free(&sink); if (ssl) SSL_free(ssl); if (ctx) SSL_CTX_free(ctx); close(fd); return -1; }
             buf = nb;
         }
         memcpy(buf + len, tmp, (size_t)n);
         len += (size_t)n;
+
+        if (!header_done) {
+            /* re-scan from a little back: the terminator can straddle two reads */
+            char *p = find_header_end(buf, searched > 3 ? searched - 3 : 0, len);
+            if (p) {
+                header_done = 1;
+                body_off = (size_t)(p - buf) + 4;
+                chunked = header_has(buf, p, "chunked");
+            } else {
+                searched = len;
+            }
+        }
+
+        if (header_done && len > body_off + fed) {
+            size_t take = len - body_off - fed;
+            const char *body_at = buf + body_off + fed;
+            fed += take;
+            if (chunked) dechunk_feed(&dc, body_at, take, sink_emit, &sink);
+            else sink_emit(&sink, body_at, take);
+        }
     }
     buf[len] = 0;
 
-    char *bodyp = strstr(buf, "\r\n\r\n");
-    if (!bodyp) {
+    if (!header_done) {
+        free(buf);
+        sink_free(&sink);
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+        if (ctx) SSL_CTX_free(ctx);
+        close(fd);
+        return -1;
+    }
+
+    long sc = 0;
+    if (strncmp(buf, "HTTP/", 5) == 0) sc = strtol(buf + 9, NULL, 10);
+    *status = sc;
+
+    if (!sink_put(&sink, 0)) { /* the body may legitimately be empty */
         free(buf);
         if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
         if (ctx) SSL_CTX_free(ctx);
         close(fd);
         return -1;
     }
-    bodyp += 4;
-
-    long sc = 0;
-    if (strncmp(buf, "HTTP/", 5) == 0) sc = strtol(buf + 9, NULL, 10);
-    *status = sc;
-
-    if (header_has(buf, bodyp - 4, "chunked")) {
-        *resp = dechunk(bodyp, strlen(bodyp));
-    } else {
-        *resp = strdup(bodyp);
-    }
+    *resp = sink.body;
 
     free(buf);
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     if (ctx) SSL_CTX_free(ctx);
     close(fd);
-    return *resp ? 0 : -1;
+    return 0;
 }
 
 #endif
 
 int http_post(const char *url, const char *api_key, const char *body,
-              long *status, char **resp) {
+              long *status, char **resp,
+              http_chunk_fn on_chunk, void *ctx) {
     char *host = NULL, *path = NULL;
     int port = 0, tls = 0;
     if (url_parse(url, &host, &port, &path, &tls) != 0) return -1;
 
     int rc;
 #ifdef _WIN32
-    rc = post_winhttp(host, port, path, api_key, body, status, resp, tls);
+    rc = post_winhttp(host, port, path, api_key, body, status, resp, tls, on_chunk, ctx);
 #else
-    rc = post_posix(host, port, path, api_key, body, status, resp, tls);
+    rc = post_posix(host, port, path, api_key, body, status, resp, tls, on_chunk, ctx);
 #endif
 
     free(host);

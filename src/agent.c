@@ -277,6 +277,7 @@ static void build_request(sb_t *b, const agent_config_t *cfg, msg_t *msgs, int n
         sb_puts(b, ",\"tools\":");
         sb_puts(b, TOOLS_JSON);
     }
+    if (cfg->stream) sb_puts(b, ",\"stream\":true");
     sb_putc(b, '}');
 }
 
@@ -688,6 +689,180 @@ static char *tool_write_file(const char *path, const char *content) {
     fclose(f);
     if (w != n) return strdup("write_file: short write");
     return strdup("ok");
+}
+
+/* ---- streamed responses ----
+ *
+ * With stream=true the response is a series of server-sent events, each a
+ * fragment of the answer: text arrives as `delta.content`, tool calls as
+ * `delta.tool_calls[]` pieces that have to be collected by index. The text is
+ * handed to the session's output as it arrives; the assembled result is the
+ * same shape parse_response() produces, so the loop does not care which way
+ * the answer came in.
+ */
+typedef struct {
+    sb_t name;
+    sb_t args;
+    char *id;
+    int index;
+} tc_frag_t;
+
+typedef struct {
+    const agent_config_t *cfg;
+    sb_t line;    /* the event line being received */
+    sb_t content; /* the answer so far */
+    tc_frag_t *frags;
+    int nfrags, cap;
+    int printed;  /* something reached out() */
+    int noted;    /* the thinking hint was already shown */
+    int done;     /* the stream said [DONE] */
+} stream_t;
+
+static void stream_init(stream_t *st, const agent_config_t *cfg) {
+    st->cfg = cfg;
+    sb_init(&st->line);
+    sb_init(&st->content);
+    st->frags = NULL;
+    st->nfrags = 0;
+    st->cap = 0;
+    st->printed = 0;
+    st->noted = 0;
+    st->done = 0;
+}
+
+static void stream_free(stream_t *st) {
+    sb_free(&st->line);
+    sb_free(&st->content);
+    for (int i = 0; i < st->nfrags; i++) {
+        sb_free(&st->frags[i].name);
+        sb_free(&st->frags[i].args);
+        free(st->frags[i].id);
+    }
+    free(st->frags);
+    st->frags = NULL;
+    st->nfrags = st->cap = 0;
+}
+
+static tc_frag_t *stream_frag(stream_t *st, int index) {
+    for (int i = 0; i < st->nfrags; i++)
+        if (st->frags[i].index == index) return &st->frags[i];
+
+    if (st->nfrags == st->cap) {
+        int ncap = st->cap ? st->cap * 2 : 4;
+        tc_frag_t *nf = (tc_frag_t *)realloc(st->frags, sizeof(*nf) * (size_t)ncap);
+        if (!nf) return NULL;
+        st->frags = nf;
+        st->cap = ncap;
+    }
+    {
+        tc_frag_t *f = &st->frags[st->nfrags++];
+        memset(f, 0, sizeof(*f));
+        f->index = index;
+        sb_init(&f->name);
+        sb_init(&f->args);
+        return f;
+    }
+}
+
+/* One `data:` payload: a partial answer, a partial tool call, or [DONE]. */
+static void stream_event(stream_t *st, const char *json) {
+    json_value_t *root, *delta, *calls;
+    const char *text;
+
+    while (*json == ' ') json++;
+    if (!*json) return;
+    if (strcmp(json, "[DONE]") == 0) {
+        st->done = 1;
+        return;
+    }
+
+    root = json_parse(json);
+    if (!root) return;
+
+    delta = json_path(root, "choices.0.delta");
+    if (delta) {
+        const char *think = json_str(json_get(delta, "reasoning_content"));
+        if (think && *think && !st->printed && !st->noted) {
+            /* A reasoning model writes this before it answers; without a word
+             * the pause looks like a hang. */
+            st->noted = 1;
+            fprintf(stderr, "  -- model is thinking\n");
+        }
+        text = json_str(json_get(delta, "content"));
+        if (text && *text) {
+            sb_puts(&st->content, text);
+            st->printed = 1;
+            if (st->cfg->out) st->cfg->out(text);
+        }
+        calls = json_get(delta, "tool_calls");
+        if (calls && calls->type == JSON_ARRAY) {
+            for (int i = 0; i < calls->count; i++) {
+                json_value_t *c = json_at(calls, i), *fn;
+                int index = (int)json_num(json_get(c, "index"), i);
+                tc_frag_t *f = stream_frag(st, index);
+                const char *s;
+                if (!f) break;
+                if ((s = json_str(json_get(c, "id"))) && !f->id) f->id = strdup(s);
+                if ((fn = json_get(c, "function"))) {
+                    if ((s = json_str(json_get(fn, "name")))) sb_puts(&f->name, s);
+                    if ((s = json_str(json_get(fn, "arguments")))) sb_puts(&f->args, s);
+                }
+            }
+        }
+    }
+    json_free(root);
+}
+
+/* Feed raw response bytes: accumulate whole lines, act on the complete ones. */
+static void stream_feed(void *ctx, const char *data, size_t len) {
+    stream_t *st = (stream_t *)ctx;
+
+    for (size_t i = 0; i < len; i++) {
+        char c = data[i];
+        if (c != '\n') {
+            if (c != '\r') sb_putc(&st->line, c);
+            continue;
+        }
+        if (st->line.len > 5 && strncmp(st->line.d, "data:", 5) == 0) {
+            sb_term(&st->line); /* sb_putc does not terminate */
+            stream_event(st, st->line.d + 5);
+        }
+        st->line.len = 0;
+        if (st->done) break;
+    }
+}
+
+/* Turn the collected fragments into the same shape parse_response returns. */
+static void stream_result(stream_t *st, char **content_out, tc_t **calls_out, int *ncalls_out) {
+    tc_t *calls = NULL;
+    int n = 0;
+
+    for (int i = 0; i < st->nfrags; i++) {
+        if (!st->frags[i].name.len) continue;
+        sb_term(&st->frags[i].name);
+        sb_term(&st->frags[i].args);
+        n++;
+    }
+    if (n) {
+        int j = 0;
+        calls = (tc_t *)calloc((size_t)n, sizeof(*calls));
+        if (calls) {
+            for (int i = 0; i < st->nfrags; i++) {
+                if (!st->frags[i].name.len) continue;
+                calls[j].id = strdup(st->frags[i].id ? st->frags[i].id : "");
+                calls[j].name = strdup(st->frags[i].name.d);
+                calls[j].args = strdup(st->frags[i].args.d);
+                j++;
+            }
+            n = j;
+        } else {
+            n = 0;
+        }
+    }
+
+    *calls_out = calls;
+    *ncalls_out = n;
+    *content_out = st->content.len ? strdup(st->content.d) : NULL;
 }
 
 /* ---- grep ----
@@ -1352,13 +1527,16 @@ static void msgs_drop_last(msgs_t *m) {
 
 /* One request/response round. Returns 1 on success and hands back the
  * assistant text plus any tool calls; nothing is written to the history here,
- * the caller decides what to do with the result. */
+ * the caller decides what to do with the result. The answer reaches cfg->out
+ * in the same step, streamed while it is written or once it has arrived. */
 static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
                      char **content_out, tc_t **calls_out, int *ncalls_out) {
     sb_t req;
     char url[1024];
     long status = 0;
     char *resp = NULL;
+    stream_t st;
+    int streaming = cfg->stream;
 
     *content_out = NULL;
     *calls_out = NULL;
@@ -1368,10 +1546,14 @@ static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
     build_request(&req, cfg, msgs->items, msgs->count, with_tools);
     sb_term(&req);
 
+    if (streaming) stream_init(&st, cfg);
+
     snprintf(url, sizeof(url), "%s/chat/completions", cfg->base_url);
-    if (http_post(url, cfg->api_key, req.d, &status, &resp) != 0) {
+    if (http_post(url, cfg->api_key, req.d, &status, &resp,
+                  streaming ? stream_feed : NULL, streaming ? &st : NULL) != 0) {
         fprintf(stderr, "error: http request failed\n");
         sb_free(&req);
+        if (streaming) stream_free(&st);
         return 0;
     }
     sb_free(&req);
@@ -1379,10 +1561,25 @@ static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
     if (status != 200) {
         fprintf(stderr, "error: http status %ld\n%s\n", status, resp ? resp : "");
         free(resp);
+        if (streaming) stream_free(&st);
         return 0;
     }
 
-    *content_out = parse_response(resp, calls_out, ncalls_out);
+    if (streaming) {
+        stream_result(&st, content_out, calls_out, ncalls_out);
+        if (!*content_out && *ncalls_out == 0) {
+            /* Nothing that looked like an event: the server ignored stream and
+             * sent a plain document. */
+            *content_out = parse_response(resp, calls_out, ncalls_out);
+            if (*content_out && *ncalls_out == 0 && cfg->out) cfg->out(*content_out);
+        } else if (*content_out && *ncalls_out == 0 && !st.printed) {
+            if (cfg->out) cfg->out(*content_out);
+        }
+        stream_free(&st);
+    } else {
+        *content_out = parse_response(resp, calls_out, ncalls_out);
+        if (*content_out && *ncalls_out == 0 && cfg->out) cfg->out(*content_out);
+    }
     free(resp);
     return 1;
 }

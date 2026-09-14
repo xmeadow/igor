@@ -49,6 +49,7 @@ Via environment variables (same on every OS):
 | `LLM_MODEL`    | `gpt-4o-mini`                 | Model name                           |
 | `LLM_MAX_STEPS`| `16`                          | Tool-using iterations before the agent is asked to summarise |
 | `IGOR_COMMAND_TIMEOUT` | `120`                 | Seconds a shell command may run (Win32) |
+| `LLM_STREAM`   | `1`                           | Show the answer while it is being written |
 
 Defaults can also be baked in at compile time with `make LLM_API_KEY=... LLM_BASE_URL=... LLM_MODEL=...`.
 
@@ -97,6 +98,17 @@ skips hidden directories and binary files and caps its output at 100 matches
 of them with `all`. It refuses when the snippet is missing, matches more than
 once without being told which, or the file holds binary data — and it reports
 the line it changed.
+
+## Streaming
+
+The answer is requested with `stream: true` and printed as it arrives, so a
+long answer does not look like a hang. Two things worth knowing:
+
+- Reasoning models (some providers, for instance) write `reasoning_content` before
+  any answer text. That is not printed - only a one-line `model is thinking`
+  hint on stderr, so the pause is explained instead of mysterious.
+- `LLM_STREAM=0` turns streaming off. If a server ignores `stream` and answers
+  with a plain JSON document, igor notices and reads it the ordinary way.
 
 ## How it works
 
