@@ -20,6 +20,8 @@
 #define GETCWD _getcwd
 #else
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #define POPEN popen
 #define PCLOSE pclose
@@ -32,7 +34,8 @@ static const char *TOOLS_JSON =
     "["
     "{\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"description\":\"Run a shell command and return its exit status and output. Use this to compile, run tests, or inspect the environment.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}}},"
     "{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"description\":\"Read a text file, or a byte range of any file. Binary content is returned as a hex dump with absolute offsets.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"first byte to read, defaults to 0\"},\"limit\":{\"type\":\"integer\",\"description\":\"how many bytes to read\"}},\"required\":[\"path\"]}}},"
-    "{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"Create or overwrite a file with the given contents.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}}"
+    "{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"Create or overwrite a file with the given contents.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}},"
+    "{\"type\":\"function\",\"function\":{\"name\":\"grep\",\"description\":\"Find a literal string in files, recursively. Returns path, line number and line. Hidden directories are skipped, as are binary files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\",\"description\":\"file or directory, defaults to .\"},\"ignore_case\":{\"type\":\"boolean\"}},\"required\":[\"pattern\"]}}}"
     "]";
 
 /*
@@ -47,8 +50,9 @@ static const char *SYSTEM_PROMPT =
     "\n"
     "Tools:\n"
     "- run_command: run a shell command and get its exit status, stdout and stderr.\n"
-    "- read_file: read a text file.\n"
+    "- read_file: read a text file, or a byte range of any file.\n"
     "- write_file: create or overwrite a file.\n"
+    "- grep: find a literal string in files, recursively.\n"
     "\n"
     "Work habits:\n"
     "- Inspect the real state of things (read files, run commands) instead of guessing.\n"
@@ -682,6 +686,165 @@ static char *tool_write_file(const char *path, const char *content) {
     return strdup("ok");
 }
 
+/* ---- grep ----
+ *
+ * The target platform has no grep and no useful recursive findstr, so the
+ * search lives in the process: a literal match, a recursive walk, hidden
+ * directories and binary files skipped, results capped so one search cannot
+ * flood the context.
+ */
+#define GREP_MAX_HITS 100
+#define GREP_MAX_LINE 200
+
+typedef struct {
+    const char *pattern;
+    size_t plen;
+    int ignore_case;
+    int hits;
+    int stopped;
+    sb_t *out;
+} grep_t;
+
+static char ascii_lower(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+}
+
+static int line_matches(const char *line, size_t len, const grep_t *g) {
+    size_t i, j;
+
+    if (g->plen == 0 || len < g->plen) return 0;
+    for (i = 0; i + g->plen <= len; i++) {
+        for (j = 0; j < g->plen; j++) {
+            char a = line[i + j], b = g->pattern[j];
+            if (g->ignore_case) {
+                a = ascii_lower(a);
+                b = ascii_lower(b);
+            }
+            if (a != b) break;
+        }
+        if (j == g->plen) return 1;
+    }
+    return 0;
+}
+
+static int is_dir(const char *path) {
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static void grep_file(const char *path, grep_t *g) {
+    char *buf;
+    size_t n, i = 0;
+    long lineno = 1;
+    FILE *f = fopen(path, "rb");
+
+    if (!f) return;
+    buf = (char *)malloc(MAX_READ + 1);
+    if (!buf) {
+        fclose(f);
+        return;
+    }
+    n = fread(buf, 1, MAX_READ, f);
+    fclose(f);
+    buf[n] = 0;
+
+    if (looks_binary(buf, n)) {
+        free(buf);
+        return;
+    }
+
+    while (i < n && !g->stopped) {
+        size_t start = i, len;
+        while (i < n && buf[i] != '\n') i++;
+        len = i - start;
+        if (i < n) i++; /* step over the newline */
+        if (len && buf[start + len - 1] == '\r') len--;
+
+        if (line_matches(buf + start, len, g)) {
+            size_t show = len < GREP_MAX_LINE ? len : GREP_MAX_LINE;
+            sb_printf(g->out, "%s:%ld: ", path, lineno);
+            sb_append_utf8(g->out, buf + start, show);
+            if (show < len) sb_puts(g->out, "...");
+            sb_putc(g->out, '\n');
+            if (++g->hits >= GREP_MAX_HITS) g->stopped = 1;
+        }
+        lineno++;
+    }
+    free(buf);
+}
+
+static void grep_path(const char *path, grep_t *g) {
+    if (g->stopped) return;
+
+    if (!is_dir(path)) {
+        grep_file(path, g);
+        return;
+    }
+
+#ifdef _WIN32
+    {
+        char pattern[1024];
+        WIN32_FIND_DATAA fd;
+        HANDLE h;
+
+        snprintf(pattern, sizeof(pattern), "%s\\*", path);
+        h = FindFirstFileA(pattern, &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            char child[1024];
+            if (fd.cFileName[0] == '.') continue; /* .git, .ok, ... */
+            snprintf(child, sizeof(child), "%s\\%s", path, fd.cFileName);
+            grep_path(child, g);
+        } while (!g->stopped && FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    {
+        DIR *d = opendir(path);
+        struct dirent *e;
+
+        if (!d) return;
+        while (!g->stopped && (e = readdir(d))) {
+            char child[1024];
+            if (e->d_name[0] == '.') continue;
+            snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+            grep_path(child, g);
+        }
+        closedir(d);
+    }
+#endif
+}
+
+static char *tool_grep(const char *pattern, const char *path, int ignore_case) {
+    grep_t g;
+    sb_t out;
+
+    g.pattern = pattern;
+    g.plen = strlen(pattern);
+    g.ignore_case = ignore_case;
+    g.hits = 0;
+    g.stopped = 0;
+    g.out = &out;
+
+    sb_init(&out);
+    grep_path(path && *path ? path : ".", &g);
+
+    if (g.hits == 0) {
+        sb_printf(&out, "no match for \"%s\" under %s\n", pattern,
+                  path && *path ? path : ".");
+    } else if (g.stopped) {
+        sb_printf(&out, "... stopped after %d matches\n", GREP_MAX_HITS);
+    }
+    sb_printf(&out, "(%d match%s)\n", g.hits, g.hits == 1 ? "" : "es");
+    sb_term(&out);
+    return out.d;
+}
+
 static char *run_tool(const char *name, const char *args_json) {
     const char *args_text = (args_json && *args_json) ? args_json : "{}";
     json_value_t *args = json_parse(args_text);
@@ -699,6 +862,9 @@ static char *run_tool(const char *name, const char *args_json) {
         } else if (strcmp(name, "read_file") == 0 || strcmp(name, "write_file") == 0) {
             const char *p = json_str(json_get(args, "path"));
             if (p) detail = p;
+        } else if (strcmp(name, "grep") == 0) {
+            const char *pat = json_str(json_get(args, "pattern"));
+            if (pat) detail = pat;
         }
         fprintf(stderr, "  -> %s: %s\n", name, detail);
     }
@@ -716,6 +882,11 @@ static char *run_tool(const char *name, const char *args_json) {
         const char *p = json_str(json_get(args, "path"));
         const char *c = json_str(json_get(args, "content"));
         result = (p && c) ? tool_write_file(p, c) : strdup("write_file: missing 'path' or 'content'");
+    } else if (strcmp(name, "grep") == 0) {
+        const char *pat = json_str(json_get(args, "pattern"));
+        const char *p = json_str(json_get(args, "path"));
+        int ignore_case = json_num(json_get(args, "ignore_case"), 0) != 0;
+        result = pat ? tool_grep(pat, p, ignore_case) : strdup("grep: missing 'pattern'");
     } else {
         sb_t b;
         sb_init(&b);

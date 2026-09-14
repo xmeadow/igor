@@ -78,6 +78,20 @@ export LLM_BASE_URL=https://api.example.com   # e.g. DeepSeek, Mistral, a local 
 export LLM_MODEL=your-model
 ```
 
+## Tools
+
+| Tool | What it does |
+| --- | --- |
+| `run_command` | run a shell command, return exit status and output |
+| `read_file` | read a file or a byte range; content with a NUL byte comes back as a hex dump |
+| `write_file` | create or overwrite a file |
+| `grep` | find a literal string in files, recursively |
+
+`grep` is implemented in the process rather than shelled out: the target
+platform has no `grep`, and its `findstr` has no recursive mode worth using. It
+skips hidden directories and binary files and caps its output at 100 matches
+(200 characters per line) so one search cannot flood the context.
+
 ## How it works
 
 ```mermaid
