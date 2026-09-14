@@ -214,7 +214,7 @@ static void msgs_free(msgs_t *m) {
 }
 
 /* ---- request building ---- */
-static void build_request(sb_t *b, const agent_config_t *cfg, msg_t *msgs, int nmsg) {
+static void build_request(sb_t *b, const agent_config_t *cfg, msg_t *msgs, int nmsg, int with_tools) {
     sb_puts(b, "{\"model\":");
     char *q = json_quote_alloc(cfg->model);
     sb_puts(b, q);
@@ -263,8 +263,12 @@ static void build_request(sb_t *b, const agent_config_t *cfg, msg_t *msgs, int n
         }
         sb_putc(b, '}');
     }
-    sb_puts(b, "],\"tools\":");
-    sb_puts(b, TOOLS_JSON);
+    sb_putc(b, ']');
+    /* Left out for the wrap-up turn: without tools the model has to answer. */
+    if (with_tools) {
+        sb_puts(b, ",\"tools\":");
+        sb_puts(b, TOOLS_JSON);
+    }
     sb_putc(b, '}');
 }
 
@@ -363,11 +367,6 @@ static void sb_put_hex_dump(sb_t *b, const char *s, size_t len, long base) {
 /* ---- tools ---- */
 
 #ifdef _WIN32
-/* Command timeout: a command that never returns (a script waiting on a dead
- * network call, say) would otherwise hang the agent for good and leave a
- * process holding igor.exe. */
-#define COMMAND_TIMEOUT_MS 120000
-
 /* Command timeout: a command that never returns (a script waiting on a dead
  * network call, say) would otherwise hang the agent for good and leave a
  * process holding igor.exe. Override with IGOR_COMMAND_TIMEOUT (seconds). */
@@ -897,45 +896,109 @@ void agent_session_reset(agent_session_t *s) {
     add_system_message(&s->msgs);
 }
 
+/* Drop the newest message again, freeing it. */
+static void msgs_drop_last(msgs_t *m) {
+    if (m->count == 0) return;
+    msg_t *x = &m->items[--m->count];
+    free(x->role);
+    free(x->content);
+    free(x->tool_call_id);
+    for (int j = 0; j < x->ncalls; j++) {
+        free(x->calls[j].id);
+        free(x->calls[j].name);
+        free(x->calls[j].args);
+    }
+    free(x->calls);
+    memset(x, 0, sizeof(*x));
+}
+
+/* One request/response round. Returns 1 on success and hands back the
+ * assistant text plus any tool calls; nothing is written to the history here,
+ * the caller decides what to do with the result. */
+static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
+                     char **content_out, tc_t **calls_out, int *ncalls_out) {
+    sb_t req;
+    char url[1024];
+    long status = 0;
+    char *resp = NULL;
+
+    *content_out = NULL;
+    *calls_out = NULL;
+    *ncalls_out = 0;
+
+    if (!sb_init(&req)) return 0;
+    build_request(&req, cfg, msgs->items, msgs->count, with_tools);
+    sb_term(&req);
+
+    snprintf(url, sizeof(url), "%s/chat/completions", cfg->base_url);
+    if (http_post(url, cfg->api_key, req.d, &status, &resp) != 0) {
+        fprintf(stderr, "error: http request failed\n");
+        sb_free(&req);
+        return 0;
+    }
+    sb_free(&req);
+
+    if (status != 200) {
+        fprintf(stderr, "error: http status %ld\n%s\n", status, resp ? resp : "");
+        free(resp);
+        return 0;
+    }
+
+    *content_out = parse_response(resp, calls_out, ncalls_out);
+    free(resp);
+    return 1;
+}
+
+/* The step budget is gone but the user still deserves an answer, so ask for a
+ * summary instead of stopping silently. The tools are left out of that request,
+ * and the prompt that triggers it is not kept in the history - only the
+ * summary is. */
+static char *wrap_up(agent_session_t *s) {
+    static const char *ask =
+        "You have used up your step budget. Do not start anything new. Tell the user "
+        "concisely what you did, what you found, what is still open, and what you would "
+        "do next.";
+    char *content = NULL, *answer = NULL;
+    tc_t *calls = NULL;
+    int ncalls = 0;
+
+    fprintf(stderr, "  -- step budget of %d used up, asking for a summary\n",
+            s->cfg.max_steps);
+
+    if (!msgs_add(&s->msgs, "user", ask, NULL)) return NULL;
+    if (http_turn(&s->cfg, &s->msgs, 0, &content, &calls, &ncalls)) {
+        if (ncalls == 0) {
+            answer = content;
+        } else {
+            free(content);
+            for (int i = 0; i < ncalls; i++) {
+                free(calls[i].id);
+                free(calls[i].name);
+                free(calls[i].args);
+            }
+            free(calls);
+        }
+    }
+    msgs_drop_last(&s->msgs);
+    if (answer && *answer) msgs_add(&s->msgs, "assistant", answer, NULL);
+    return answer;
+}
+
 char *agent_chat(agent_session_t *s, const char *user_input) {
     if (!msgs_add(&s->msgs, "user", user_input, NULL)) return NULL;
 
     char *answer = NULL;
-    int done = 0;
+    int done = 0, step = 0;
 
-    for (int step = 0; step < s->cfg.max_steps && !done; step++) {
-        sb_t req;
-        sb_init(&req);
-        build_request(&req, &s->cfg, s->msgs.items, s->msgs.count);
-        sb_term(&req);
-
-        char url[1024];
-        snprintf(url, sizeof(url), "%s/chat/completions", s->cfg.base_url);
-
-        long status = 0;
-        char *resp = NULL;
-        if (http_post(url, s->cfg.api_key, req.d, &status, &resp) != 0) {
-            fprintf(stderr, "error: http request failed\n");
-            sb_free(&req);
-            break;
-        }
-        sb_free(&req);
-
-        if (status != 200) {
-            fprintf(stderr, "error: http status %ld\n%s\n", status, resp ? resp : "");
-            free(resp);
-            break;
-        }
-
+    for (; step < s->cfg.max_steps && !done; step++) {
+        char *content = NULL;
         tc_t *calls = NULL;
         int ncalls = 0;
-        char *content = parse_response(resp, &calls, &ncalls);
-        free(resp);
+
+        if (!http_turn(&s->cfg, &s->msgs, 1, &content, &calls, &ncalls)) break;
 
         if (ncalls == 0) {
-            if (content) {
-                msgs_add(&s->msgs, "assistant", content, NULL);
-            }
+            if (content) msgs_add(&s->msgs, "assistant", content, NULL);
             answer = content; /* transfer ownership to caller */
             done = 1;
             break;
@@ -955,8 +1018,7 @@ char *agent_chat(agent_session_t *s, const char *user_input) {
         free(calls);
     }
 
-    if (!done) {
-        fprintf(stderr, "stopped after %d steps without a final answer\n", s->cfg.max_steps);
-    }
+    /* Out of steps rather than an error: end with a summary, never in silence. */
+    if (!done && step == s->cfg.max_steps) answer = wrap_up(s);
     return answer;
 }

@@ -47,7 +47,7 @@ Via environment variables (same on every OS):
 | `LLM_API_KEY`  | *(required)*                  | API key for the LLM provider          |
 | `LLM_BASE_URL` | `https://api.openai.com/v1`   | Base URL of the OpenAI-compatible API |
 | `LLM_MODEL`    | `gpt-4o-mini`                 | Model name                           |
-| `LLM_MAX_STEPS`| `16`                          | Max agent loop iterations             |
+| `LLM_MAX_STEPS`| `16`                          | Tool-using iterations before the agent is asked to summarise |
 | `IGOR_COMMAND_TIMEOUT` | `120`                 | Seconds a shell command may run (Win32) |
 
 Defaults can also be baked in at compile time with `make LLM_API_KEY=... LLM_BASE_URL=... LLM_MODEL=...`.
@@ -89,7 +89,14 @@ flowchart TD
     E --> F[Append tool results]
     F --> C
     D -- no --> G[Print final text]
+    D -- out of steps --> H[Ask for a summary, without tools]
+    H --> G
 ```
+
+The step limit bounds tool-using iterations, not the answer: when it is used up
+the agent gets one more request with the tools left out, so a run always ends
+with text. That request is not kept in the conversation history — only the
+summary is.
 
 ## Prep prompt
 
