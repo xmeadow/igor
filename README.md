@@ -85,12 +85,18 @@ export LLM_MODEL=your-model
 | `run_command` | run a shell command, return exit status and output |
 | `read_file` | read a file or a byte range; content with a NUL byte comes back as a hex dump |
 | `write_file` | create or overwrite a file |
+| `edit` | replace an exact snippet in a text file, instead of rewriting the whole file |
 | `grep` | find a literal string in files, recursively |
 
 `grep` is implemented in the process rather than shelled out: the target
 platform has no `grep`, and its `findstr` has no recursive mode worth using. It
 skips hidden directories and binary files and caps its output at 100 matches
 (200 characters per line) so one search cannot flood the context.
+
+`edit` replaces the first exact match, or the one named by `occurrence`, or all
+of them with `all`. It refuses when the snippet is missing, matches more than
+once without being told which, or the file holds binary data — and it reports
+the line it changed.
 
 ## How it works
 

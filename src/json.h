@@ -35,6 +35,13 @@ json_value_t *json_path(const json_value_t *root, const char *path);
 /* Numeric value of a JSON_NUMBER, or def when missing / not a number. */
 double json_num(const json_value_t *v, double def);
 
+/**
+ * Truth value of a JSON_BOOL, or def when missing / not a value we can read.
+ * "true" and "1" as strings are accepted too: a flag that is silently ignored
+ * is worse than one that is read generously.
+ */
+int json_bool(const json_value_t *v, int def);
+
 /* Return a malloc'd JSON string literal (quoted + escaped). Caller frees. */
 char *json_quote_alloc(const char *s);
 

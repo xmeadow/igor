@@ -35,6 +35,7 @@ static const char *TOOLS_JSON =
     "{\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"description\":\"Run a shell command and return its exit status and output. Use this to compile, run tests, or inspect the environment.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}}},"
     "{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"description\":\"Read a text file, or a byte range of any file. Binary content is returned as a hex dump with absolute offsets.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"first byte to read, defaults to 0\"},\"limit\":{\"type\":\"integer\",\"description\":\"how many bytes to read\"}},\"required\":[\"path\"]}}},"
     "{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"Create or overwrite a file with the given contents.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}},"
+    "{\"type\":\"function\",\"function\":{\"name\":\"edit\",\"description\":\"Replace an exact snippet in a text file, instead of rewriting the whole file. Reports the line it changed. Fails when the snippet is not there, or is there more than once and you did not say which occurrence or pass all.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"find\":{\"type\":\"string\",\"description\":\"exact text to replace, indentation included\"},\"replace\":{\"type\":\"string\",\"description\":\"replacement text; empty deletes the snippet\"},\"occurrence\":{\"type\":\"integer\",\"description\":\"which match to replace, 1-based\"},\"all\":{\"type\":\"boolean\",\"description\":\"replace every match\"}},\"required\":[\"path\",\"find\",\"replace\"]}}},"
     "{\"type\":\"function\",\"function\":{\"name\":\"grep\",\"description\":\"Find a literal string in files, recursively. Returns path, line number and line. Hidden directories are skipped, as are binary files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\",\"description\":\"file or directory, defaults to .\"},\"ignore_case\":{\"type\":\"boolean\"}},\"required\":[\"pattern\"]}}}"
     "]";
 
@@ -52,6 +53,7 @@ static const char *SYSTEM_PROMPT =
     "- run_command: run a shell command and get its exit status, stdout and stderr.\n"
     "- read_file: read a text file, or a byte range of any file.\n"
     "- write_file: create or overwrite a file.\n"
+    "- edit: replace an exact snippet in a file, instead of rewriting the whole file.\n"
     "- grep: find a literal string in files, recursively.\n"
     "\n"
     "Work habits:\n"
@@ -845,6 +847,173 @@ static char *tool_grep(const char *pattern, const char *path, int ignore_case) {
     return out.d;
 }
 
+/* ---- edit ----
+ *
+ * Replace an exact snippet rather than rewriting the whole file: cheaper, and
+ * it cannot silently drop the parts the model did not reproduce.
+ */
+#define EDIT_MAX (8 * 1024 * 1024)
+
+static char *tool_edit(const char *path, const char *find, const char *replace,
+                       int occurrence, int all) {
+    FILE *f;
+    char *buf, *out;
+    sb_t r;
+    long size = 0, line = 1, first_line = 0;
+    size_t n, flen, rlen, p = 0, q = 0;
+    int count = 0, idx = 0, chosen;
+    sb_t where;
+
+    flen = strlen(find);
+    rlen = strlen(replace);
+    sb_init(&r);
+
+    if (flen == 0) {
+        sb_puts(&r, "edit: 'find' must not be empty");
+        sb_term(&r);
+        return r.d;
+    }
+
+    f = fopen(path, "rb");
+    if (!f) {
+        sb_puts(&r, "edit: could not open the file");
+        sb_term(&r);
+        return r.d;
+    }
+    if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+    if (size < 0 || size > EDIT_MAX) {
+        fclose(f);
+        sb_printf(&r, "edit: file is %ld bytes, too large to edit in place (limit %d)",
+                  size, EDIT_MAX);
+        sb_term(&r);
+        return r.d;
+    }
+    rewind(f);
+    buf = (char *)malloc((size_t)size + 1);
+    if (!buf) {
+        fclose(f);
+        sb_puts(&r, "edit: out of memory");
+        sb_term(&r);
+        return r.d;
+    }
+    n = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[n] = 0;
+
+    if (looks_binary(buf, n)) {
+        free(buf);
+        sb_puts(&r, "edit: the file holds binary data, refusing to treat it as text");
+        sb_term(&r);
+        return r.d;
+    }
+
+    /* Where does the snippet sit, and how often? */
+    sb_init(&where);
+    while (p < n) {
+        size_t k;
+        if (p + flen <= n && memcmp(buf + p, find, flen) == 0) {
+            count++;
+            if (count <= 4) {
+                sb_printf(&where, "%sline %ld", count == 1 ? "" : ", ", line);
+                if (count == 4) sb_puts(&where, ", ...");
+            }
+            for (k = 0; k < flen; k++)
+                if (buf[p + k] == '\n') line++;
+            p += flen;
+        } else {
+            if (buf[p] == '\n') line++;
+            p++;
+        }
+    }
+
+    if (count == 0) {
+        free(buf);
+        sb_printf(&r, "edit: 'find' is not in %s", path);
+        sb_free(&where);
+        sb_term(&r);
+        return r.d;
+    }
+    if (!all && occurrence <= 0 && count > 1) {
+        free(buf);
+        sb_printf(&r, "edit: 'find' matches %d times in %s (%s); pass occurrence=N or all=true",
+                  count, path, where.d);
+        sb_free(&where);
+        sb_term(&r);
+        return r.d;
+    }
+    if (!all && occurrence > count) {
+        free(buf);
+        sb_printf(&r, "edit: occurrence %d is out of range, 'find' matches %d times in %s",
+                  occurrence, count, path);
+        sb_free(&where);
+        sb_term(&r);
+        return r.d;
+    }
+    chosen = all ? count : 1;
+    sb_free(&where);
+
+    /* Rebuild the file with the chosen matches replaced. */
+    {
+        long delta = (long)chosen * ((long)rlen - (long)flen);
+        out = (char *)malloc(n + (delta > 0 ? (size_t)delta : 0) + 1);
+    }
+    if (!out) {
+        free(buf);
+        sb_puts(&r, "edit: out of memory");
+        sb_term(&r);
+        return r.d;
+    }
+
+    p = 0;
+    line = 1;
+    while (p < n) {
+        size_t k;
+        int take = 0;
+        if (p + flen <= n && memcmp(buf + p, find, flen) == 0) {
+            idx++;
+            take = all || (occurrence > 0 ? idx == occurrence : idx == 1);
+            if (take && first_line == 0) first_line = line;
+            for (k = 0; k < flen; k++)
+                if (buf[p + k] == '\n') line++;
+            if (take) {
+                memcpy(out + q, replace, rlen);
+                q += rlen;
+            } else {
+                memcpy(out + q, buf + p, flen);
+                q += flen;
+            }
+            p += flen;
+        } else {
+            if (buf[p] == '\n') line++;
+            out[q++] = buf[p++];
+        }
+    }
+    out[q] = 0;
+    free(buf);
+
+    f = fopen(path, "wb");
+    if (!f) {
+        free(out);
+        sb_printf(&r, "edit: could not write %s", path);
+        sb_term(&r);
+        return r.d;
+    }
+    if (fwrite(out, 1, q, f) != q) {
+        fclose(f);
+        free(out);
+        sb_printf(&r, "edit: short write to %s", path);
+        sb_term(&r);
+        return r.d;
+    }
+    fclose(f);
+    free(out);
+
+    sb_printf(&r, "edit: replaced %d of %d match(es) in %s, first at line %ld, %lu bytes now\n",
+              chosen, count, path, first_line, (unsigned long)q);
+    sb_term(&r);
+    return r.d;
+}
+
 static char *run_tool(const char *name, const char *args_json) {
     const char *args_text = (args_json && *args_json) ? args_json : "{}";
     json_value_t *args = json_parse(args_text);
@@ -859,7 +1028,8 @@ static char *run_tool(const char *name, const char *args_json) {
         if (strcmp(name, "run_command") == 0) {
             const char *c = json_str(json_get(args, "command"));
             if (c) detail = c;
-        } else if (strcmp(name, "read_file") == 0 || strcmp(name, "write_file") == 0) {
+        } else if (strcmp(name, "read_file") == 0 || strcmp(name, "write_file") == 0 ||
+                   strcmp(name, "edit") == 0) {
             const char *p = json_str(json_get(args, "path"));
             if (p) detail = p;
         } else if (strcmp(name, "grep") == 0) {
@@ -882,10 +1052,18 @@ static char *run_tool(const char *name, const char *args_json) {
         const char *p = json_str(json_get(args, "path"));
         const char *c = json_str(json_get(args, "content"));
         result = (p && c) ? tool_write_file(p, c) : strdup("write_file: missing 'path' or 'content'");
+    } else if (strcmp(name, "edit") == 0) {
+        const char *p = json_str(json_get(args, "path"));
+        const char *fnd = json_str(json_get(args, "find"));
+        const char *rep = json_str(json_get(args, "replace"));
+        int occurrence = (int)json_num(json_get(args, "occurrence"), 0);
+        int all = json_bool(json_get(args, "all"), 0);
+        result = (p && fnd && rep) ? tool_edit(p, fnd, rep, occurrence, all)
+                                   : strdup("edit: missing 'path', 'find' or 'replace'");
     } else if (strcmp(name, "grep") == 0) {
         const char *pat = json_str(json_get(args, "pattern"));
         const char *p = json_str(json_get(args, "path"));
-        int ignore_case = json_num(json_get(args, "ignore_case"), 0) != 0;
+        int ignore_case = json_bool(json_get(args, "ignore_case"), 0);
         result = pat ? tool_grep(pat, p, ignore_case) : strdup("grep: missing 'pattern'");
     } else {
         sb_t b;

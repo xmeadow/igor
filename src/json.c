@@ -314,6 +314,17 @@ double json_num(const json_value_t *v, double def) {
     return v->num;
 }
 
+int json_bool(const json_value_t *v, int def) {
+    if (!v) return def;
+    if (v->type == JSON_BOOL) return v->boolean;
+    if (v->type == JSON_NUMBER) return v->num != 0;
+    if (v->type == JSON_STRING && v->str) {
+        if (!strcmp(v->str, "true") || !strcmp(v->str, "1")) return 1;
+        if (!strcmp(v->str, "false") || !strcmp(v->str, "0")) return 0;
+    }
+    return def;
+}
+
 json_value_t *json_path(const json_value_t *root, const char *path) {
     const json_value_t *cur = root;
     const char *p = path;
