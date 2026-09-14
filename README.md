@@ -127,6 +127,26 @@ prefixed with the OS name, the shell (on Windows `cmd.exe`, explicitly not
 PowerShell), the working directory and the system directory, so the model gets
 real context on every session.
 
+### Project instructions
+
+If the working directory (or one of its parents, up to eight levels) holds an
+`AGENTS.md`, its contents are appended to the system message. `IGOR.md` and
+`CLAUDE.md` are accepted as aliases. The closest file wins; it is capped at
+8 KiB and truncated with a note if longer. A repository can therefore state its
+conventions once instead of repeating them in every prompt:
+
+```markdown
+- Build with `make` and `make win32`.
+- The demo API key lives in build_iso.sh and deploy.sh, both gitignored.
+```
+
+The path that was loaded is reported on stderr when a session starts.
+
+**Trust boundary.** This text is instruction from the repository and it becomes
+part of the system prompt. Cloning a repository therefore also brings its
+instructions to your agent. Read an `AGENTS.md` you did not write before you run
+igor next to it.
+
 ## Project layout
 
 ```

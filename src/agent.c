@@ -58,6 +58,8 @@ static const char *SYSTEM_PROMPT =
     "\n"
     "Work habits:\n"
     "- Inspect the real state of things (read files, run commands) instead of guessing.\n"
+    "- When project instructions are given above, they describe this project's conventions; follow"
+    " them unless they conflict with these rules or with what you can verify.\n"
     "- Make small, focused changes; do not refactor unrelated code.\n"
     "- Verify your work by running the build or tests when available.\n"
     "- Fix the root cause, not the symptom.\n"
@@ -1197,6 +1199,85 @@ static void sb_put_installed_tools(sb_t *b, const char *dir) {
 }
 #endif /* _WIN32 */
 
+/* ---- project instructions ----
+ *
+ * Every session otherwise starts knowing nothing about the project it is in,
+ * so conventions have to be repeated in every prompt. One file in the working
+ * directory (or one of its parents) carries them instead. Note that this text
+ * goes into the system message: it is instruction from the repository, so it
+ * can say anything - see the README.
+ */
+#define PROJECT_FILE_MAX 8192
+
+#ifdef _WIN32
+#define DIR_SEP '\\'
+#else
+#define DIR_SEP '/'
+#endif
+
+/* Cut the last path component off. Leaves a Windows drive root (C:\\) alone. */
+static void dir_up(char *dir) {
+    size_t n = strlen(dir);
+
+    while (n > 1 && (dir[n - 1] == '/' || dir[n - 1] == '\\')) dir[--n] = 0;
+    while (n > 0 && dir[n - 1] != '/' && dir[n - 1] != '\\') dir[--n] = 0;
+    while (n > 1 && (dir[n - 1] == '/' || dir[n - 1] == '\\') && dir[n - 2] != ':') dir[--n] = 0;
+}
+
+static void strip_trailing_sep(char *dir) {
+    size_t n = strlen(dir);
+    while (n > 1 && (dir[n - 1] == '/' || dir[n - 1] == '\\') && dir[n - 2] != ':') dir[--n] = 0;
+}
+
+/* The closest instruction file, or NULL. AGENTS.md is the convention; the
+ * other names are accepted because they cost nothing. */
+static char *find_project_file(const char *cwd) {
+    static const char *names[] = {"AGENTS.md", "IGOR.md", "CLAUDE.md"};
+    char dir[1024], prev[1024];
+    int level, i;
+
+    snprintf(dir, sizeof(dir), "%s", cwd);
+    strip_trailing_sep(dir);
+
+    for (level = 0; level < 8; level++) {
+        for (i = 0; i < 3; i++) {
+            char path[1200];
+            FILE *f;
+            snprintf(path, sizeof(path), "%s%c%s", dir, DIR_SEP, names[i]);
+            if ((f = fopen(path, "rb")) != NULL) {
+                fclose(f);
+                return strdup(path);
+            }
+        }
+        snprintf(prev, sizeof(prev), "%s", dir);
+        dir_up(dir);
+        if (strcmp(prev, dir) == 0) break; /* reached the root */
+    }
+    return NULL;
+}
+
+static void sb_append_project_file(sb_t *b, const char *path) {
+    FILE *f = fopen(path, "rb");
+    char *buf;
+    size_t n;
+
+    if (!f) return;
+    buf = (char *)malloc(PROJECT_FILE_MAX + 1);
+    if (!buf) {
+        fclose(f);
+        return;
+    }
+    n = fread(buf, 1, PROJECT_FILE_MAX, f);
+    fclose(f);
+
+    sb_append_utf8(b, buf, n);
+    if (n == PROJECT_FILE_MAX)
+        sb_puts(b, "\n... (truncated, the file is longer)\n");
+    else if (n == 0 || buf[n - 1] != '\n')
+        sb_putc(b, '\n');
+    free(buf);
+}
+
 static int add_system_message(msgs_t *m) {
     char cwdbuf[1024], tools_dir[1024];
     const char *cwd = GETCWD(cwdbuf, sizeof(cwdbuf)) ? cwdbuf : "(unknown)";
@@ -1214,6 +1295,14 @@ static int add_system_message(msgs_t *m) {
         sb_put_installed_tools(&sys, tools_dir);
         sb_puts(&sys, "\n");
 #endif
+    }
+
+    char *pfile = find_project_file(cwd);
+    if (pfile) {
+        sb_printf(&sys, "\nProject instructions from %s:\n", pfile);
+        sb_append_project_file(&sys, pfile);
+        fprintf(stderr, "  -- project instructions: %s\n", pfile);
+        free(pfile);
     }
 
     sb_printf(&sys, "\n%s", SYSTEM_PROMPT);
