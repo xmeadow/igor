@@ -50,6 +50,7 @@ Via environment variables (same on every OS):
 | `LLM_MAX_STEPS`| `16`                          | Tool-using iterations before the agent is asked to summarise |
 | `IGOR_COMMAND_TIMEOUT` | `120`                 | Seconds a shell command may run (Win32) |
 | `LLM_STREAM`   | `1`                           | Show the answer while it is being written |
+| `IGOR_SHOW_THINKING` | `1`                     | Show the model's reasoning, dimmed |
 
 Defaults can also be baked in at compile time with `make LLM_API_KEY=... LLM_BASE_URL=... LLM_MODEL=...`.
 
@@ -99,16 +100,33 @@ of them with `all`. It refuses when the snippet is missing, matches more than
 once without being told which, or the file holds binary data — and it reports
 the line it changed.
 
+## Telling thought, work and answer apart
+
+Igor writes three kinds of text and they have to stay apart:
+
+| What | Stream | How it looks |
+| --- | --- | --- |
+| the model's reasoning | stdout | dim, prefixed `[thinking]` |
+| what igor is doing | stderr | one line per tool call, prefixed `->`, cyan |
+| the answer | stdout | plain |
+
+On a console the difference is colour - Windows console attributes, ANSI
+everywhere else. When the output is redirected there is no colour, so the
+`[thinking]` and `->` prefixes carry it. Reasoning is shown because otherwise
+the pause is a mystery, but it should never look like the answer: it is dimmed,
+labelled, and the answer starts on a fresh line. `IGOR_SHOW_THINKING=0` hides it.
+
+One case cannot be told apart while it happens: a model often talks before it
+acts ("I'll search for that"), and in the protocol that text is an ordinary
+answer fragment. It is printed plain, and the tool line that follows marks it as
+preamble rather than an answer.
+
 ## Streaming
 
 The answer is requested with `stream: true` and printed as it arrives, so a
-long answer does not look like a hang. Two things worth knowing:
-
-- Reasoning models (some providers, for instance) write `reasoning_content` before
-  any answer text. That is not printed - only a one-line `model is thinking`
-  hint on stderr, so the pause is explained instead of mysterious.
-- `LLM_STREAM=0` turns streaming off. If a server ignores `stream` and answers
-  with a plain JSON document, igor notices and reads it the ordinary way.
+long answer does not look like a hang. `LLM_STREAM=0` turns that off. If a
+server ignores `stream` and answers with a plain JSON document, igor notices and
+reads it the ordinary way.
 
 ## How it works
 

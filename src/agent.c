@@ -149,6 +149,27 @@ static void sb_term(sb_t *b) {
     b->d[b->len] = 0;
 }
 
+/* ---- output helpers ---- */
+
+/* Progress and diagnostics, on their way to stderr. */
+static void note(const agent_config_t *cfg, int kind, const char *fmt, ...) {
+    sb_t b;
+    va_list ap;
+
+    sb_init(&b);
+    va_start(ap, fmt);
+    sb_vprintf(&b, fmt, ap);
+    va_end(ap);
+    sb_term(&b);
+    if (cfg->note) cfg->note(b.d, kind);
+    else fputs(b.d, stderr);
+    sb_free(&b);
+}
+
+static void say(const agent_config_t *cfg, int kind, const char *text) {
+    if (cfg->out) cfg->out(text, kind);
+}
+
 /* ---- message list ---- */
 typedef struct {
     char *id, *name, *args;
@@ -709,13 +730,13 @@ typedef struct {
 
 typedef struct {
     const agent_config_t *cfg;
-    sb_t line;    /* the event line being received */
-    sb_t content; /* the answer so far */
+    sb_t line;     /* the event line being received */
+    sb_t content;  /* the answer so far */
     tc_frag_t *frags;
     int nfrags, cap;
-    int printed;  /* something reached out() */
-    int noted;    /* the thinking hint was already shown */
-    int done;     /* the stream said [DONE] */
+    int printed;      /* answer text reached out() */
+    int thought_open; /* a [thinking] block is open */
+    int done;         /* the stream said [DONE] */
 } stream_t;
 
 static void stream_init(stream_t *st, const agent_config_t *cfg) {
@@ -726,7 +747,7 @@ static void stream_init(stream_t *st, const agent_config_t *cfg) {
     st->nfrags = 0;
     st->cap = 0;
     st->printed = 0;
-    st->noted = 0;
+    st->thought_open = 0;
     st->done = 0;
 }
 
@@ -764,6 +785,13 @@ static tc_frag_t *stream_frag(stream_t *st, int index) {
     }
 }
 
+/* Close an open reasoning block, so the answer starts on its own line. */
+static void stream_close_thought(stream_t *st) {
+    if (!st->thought_open) return;
+    st->thought_open = 0;
+    say(st->cfg, IGOR_TEXT, "\n");
+}
+
 /* One `data:` payload: a partial answer, a partial tool call, or [DONE]. */
 static void stream_event(stream_t *st, const char *json) {
     json_value_t *root, *delta, *calls;
@@ -782,17 +810,21 @@ static void stream_event(stream_t *st, const char *json) {
     delta = json_path(root, "choices.0.delta");
     if (delta) {
         const char *think = json_str(json_get(delta, "reasoning_content"));
-        if (think && *think && !st->printed && !st->noted) {
-            /* A reasoning model writes this before it answers; without a word
-             * the pause looks like a hang. */
-            st->noted = 1;
-            fprintf(stderr, "  -- model is thinking\n");
+        if (think && *think && st->cfg->show_thought) {
+            /* The model reasons before it answers. Hidden, the pause looks like
+             * a hang; shown, it must not look like the answer. */
+            if (!st->thought_open) {
+                st->thought_open = 1;
+                say(st->cfg, IGOR_THOUGHT, "[thinking] ");
+            }
+            say(st->cfg, IGOR_THOUGHT, think);
         }
         text = json_str(json_get(delta, "content"));
         if (text && *text) {
+            stream_close_thought(st);
             sb_puts(&st->content, text);
             st->printed = 1;
-            if (st->cfg->out) st->cfg->out(text);
+            say(st->cfg, IGOR_TEXT, text);
         }
         calls = json_get(delta, "tool_calls");
         if (calls && calls->type == JSON_ARRAY) {
@@ -1191,7 +1223,7 @@ static char *tool_edit(const char *path, const char *find, const char *replace,
     return r.d;
 }
 
-static char *run_tool(const char *name, const char *args_json) {
+static char *run_tool(const agent_config_t *cfg, const char *name, const char *args_json) {
     const char *args_text = (args_json && *args_json) ? args_json : "{}";
     json_value_t *args = json_parse(args_text);
     if (!args || args->type != JSON_OBJECT) {
@@ -1213,7 +1245,7 @@ static char *run_tool(const char *name, const char *args_json) {
             const char *pat = json_str(json_get(args, "pattern"));
             if (pat) detail = pat;
         }
-        fprintf(stderr, "  -> %s: %s\n", name, detail);
+        note(cfg, IGOR_NOTE, "  -> %s: %s\n", name, detail);
     }
 
     char *result = NULL;
@@ -1453,7 +1485,7 @@ static void sb_append_project_file(sb_t *b, const char *path) {
     free(buf);
 }
 
-static int add_system_message(msgs_t *m) {
+static int add_system_message(const agent_config_t *cfg, msgs_t *m) {
     char cwdbuf[1024], tools_dir[1024];
     const char *cwd = GETCWD(cwdbuf, sizeof(cwdbuf)) ? cwdbuf : "(unknown)";
 
@@ -1476,7 +1508,7 @@ static int add_system_message(msgs_t *m) {
     if (pfile) {
         sb_printf(&sys, "\nProject instructions from %s:\n", pfile);
         sb_append_project_file(&sys, pfile);
-        fprintf(stderr, "  -- project instructions: %s\n", pfile);
+        note(cfg, IGOR_NOTE, "  -- project instructions: %s\n", pfile);
         free(pfile);
     }
 
@@ -1491,7 +1523,7 @@ agent_session_t *agent_session_new(const agent_config_t *cfg) {
     agent_session_t *s = (agent_session_t *)calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->cfg = *cfg;
-    if (!add_system_message(&s->msgs)) {
+    if (!add_system_message(&s->cfg, &s->msgs)) {
         free(s);
         return NULL;
     }
@@ -1506,7 +1538,7 @@ void agent_session_free(agent_session_t *s) {
 
 void agent_session_reset(agent_session_t *s) {
     msgs_free(&s->msgs);
-    add_system_message(&s->msgs);
+    add_system_message(&s->cfg, &s->msgs);
 }
 
 /* Drop the newest message again, freeing it. */
@@ -1551,7 +1583,7 @@ static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
     snprintf(url, sizeof(url), "%s/chat/completions", cfg->base_url);
     if (http_post(url, cfg->api_key, req.d, &status, &resp,
                   streaming ? stream_feed : NULL, streaming ? &st : NULL) != 0) {
-        fprintf(stderr, "error: http request failed\n");
+        note(cfg, IGOR_ERROR, "error: http request failed\n");
         sb_free(&req);
         if (streaming) stream_free(&st);
         return 0;
@@ -1559,7 +1591,7 @@ static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
     sb_free(&req);
 
     if (status != 200) {
-        fprintf(stderr, "error: http status %ld\n%s\n", status, resp ? resp : "");
+        note(cfg, IGOR_ERROR, "error: http status %ld\n%s\n", status, resp ? resp : "");
         free(resp);
         if (streaming) stream_free(&st);
         return 0;
@@ -1567,18 +1599,23 @@ static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
 
     if (streaming) {
         stream_result(&st, content_out, calls_out, ncalls_out);
+        stream_close_thought(&st);
         if (!*content_out && *ncalls_out == 0) {
             /* Nothing that looked like an event: the server ignored stream and
              * sent a plain document. */
             *content_out = parse_response(resp, calls_out, ncalls_out);
-            if (*content_out && *ncalls_out == 0 && cfg->out) cfg->out(*content_out);
+            if (*content_out && *ncalls_out == 0) say(cfg, IGOR_TEXT, *content_out);
         } else if (*content_out && *ncalls_out == 0 && !st.printed) {
-            if (cfg->out) cfg->out(*content_out);
+            say(cfg, IGOR_TEXT, *content_out);
+        } else if (*content_out && *ncalls_out > 0 && st.printed) {
+            /* Text followed by tool calls is the model thinking aloud, not an
+             * answer: put it on its own line, away from the trace below. */
+            say(cfg, IGOR_TEXT, "\n");
         }
         stream_free(&st);
     } else {
         *content_out = parse_response(resp, calls_out, ncalls_out);
-        if (*content_out && *ncalls_out == 0 && cfg->out) cfg->out(*content_out);
+        if (*content_out && *ncalls_out == 0) say(cfg, IGOR_TEXT, *content_out);
     }
     free(resp);
     return 1;
@@ -1597,8 +1634,8 @@ static char *wrap_up(agent_session_t *s) {
     tc_t *calls = NULL;
     int ncalls = 0;
 
-    fprintf(stderr, "  -- step budget of %d used up, asking for a summary\n",
-            s->cfg.max_steps);
+    note(&s->cfg, IGOR_NOTE, "  -- step budget of %d used up, asking for a summary\n",
+         s->cfg.max_steps);
 
     if (!msgs_add(&s->msgs, "user", ask, NULL)) return NULL;
     if (http_turn(&s->cfg, &s->msgs, 0, &content, &calls, &ncalls)) {
@@ -1643,7 +1680,7 @@ char *agent_chat(agent_session_t *s, const char *user_input) {
         free(content);
 
         for (int i = 0; i < ncalls; i++) {
-            char *result = run_tool(calls[i].name, calls[i].args);
+            char *result = run_tool(&s->cfg, calls[i].name, calls[i].args);
             msgs_add(&s->msgs, "tool", result, calls[i].id);
             free(result);
             free(calls[i].id);

@@ -143,26 +143,81 @@ static char *read_line_utf8(FILE *f) {
     return out;
 }
 
-static void out_puts(const char *s) {
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+/* ---- output ----
+ *
+ * Everything the user sees goes through here, because the three kinds of text
+ * have to stay apart: what the model thinks, what it did, and what it answers.
+ * On a console the difference is colour; anywhere else it is nothing, so the
+ * markers the caller adds carry it.
+ */
+
+static WORD default_attr;
+static int have_default_attr;
+
+static HANDLE out_handle(int to_stderr) {
+    return GetStdHandle(to_stderr ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE);
+}
+
+static int is_console(HANDLE h) {
     DWORD mode = 0;
-    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+    return h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode);
+}
+
+static WORD attr_for(int kind) {
+    switch (kind) {
+    case IGOR_THOUGHT: return FOREGROUND_INTENSITY; /* dim */
+    case IGOR_NOTE:    return FOREGROUND_GREEN | FOREGROUND_BLUE; /* cyan */
+    case IGOR_ERROR:   return FOREGROUND_RED | FOREGROUND_INTENSITY;
+    default:           return have_default_attr ? default_attr : 7;
+    }
+}
+
+static void put_text(const char *s, int kind, int to_stderr) {
+    HANDLE h = out_handle(to_stderr);
+    FILE *f = to_stderr ? stderr : stdout;
+
+    if (is_console(h)) {
         int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
         if (n <= 0) return;
         wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
         if (!w) return;
         MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
+        if (kind != IGOR_TEXT) SetConsoleTextAttribute(h, attr_for(kind));
         DWORD written = 0;
         WriteConsoleW(h, w, (DWORD)(n - 1), &written, NULL);
+        if (kind != IGOR_TEXT) SetConsoleTextAttribute(h, attr_for(IGOR_TEXT));
         free(w);
     } else {
-        fwrite(s, 1, strlen(s), stdout);
+        fwrite(s, 1, strlen(s), f);
     }
     /* Streamed answers arrive in fragments: flush so each one shows at once. */
-    fflush(stdout);
+    fflush(f);
 }
 
 #else /* POSIX */
+
+#define IGOR_ATTR_RESET "\033[0m"
+
+static int stdout_is_tty, stderr_is_tty;
+
+static const char *attr_for(int kind) {
+    switch (kind) {
+    case IGOR_THOUGHT: return "\033[2m";  /* dim */
+    case IGOR_NOTE:    return "\033[36m"; /* cyan */
+    case IGOR_ERROR:   return "\033[31m"; /* red */
+    default:           return "";
+    }
+}
+
+static void put_text(const char *s, int kind, int to_stderr) {
+    FILE *f = to_stderr ? stderr : stdout;
+    int tty = to_stderr ? stderr_is_tty : stdout_is_tty;
+
+    if (tty && kind != IGOR_TEXT) fputs(attr_for(kind), f);
+    fputs(s, f);
+    if (tty && kind != IGOR_TEXT) fputs(IGOR_ATTR_RESET, f);
+    fflush(f);
+}
 
 static char *read_line_utf8(FILE *f) {
     size_t cap = 256, len = 0;
@@ -184,13 +239,19 @@ static char *read_line_utf8(FILE *f) {
     return buf;
 }
 
+#endif /* _WIN32 */
+
 static void out_puts(const char *s) {
-    fputs(s, stdout);
-    /* Streamed answers arrive in fragments: flush so each one shows at once. */
-    fflush(stdout);
+    put_text(s, IGOR_TEXT, 0);
 }
 
-#endif /* _WIN32 */
+static void out_kind(const char *s, int kind) {
+    put_text(s, kind, 0);
+}
+
+static void note_kind(const char *s, int kind) {
+    put_text(s, kind, 1);
+}
 
 /* Read the entire remaining stdin (piped one-shot task). */
 static char *read_stdin(void) {
@@ -306,6 +367,20 @@ static int interactive_loop(const agent_config_t *cfg) {
 
 int main(int argc, char **argv) {
     agent_config_t cfg;
+#ifdef _WIN32
+    {
+        CONSOLE_SCREEN_BUFFER_INFO info;
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &info)) {
+            default_attr = info.wAttributes;
+            have_default_attr = 1;
+        }
+    }
+#else
+    stdout_is_tty = isatty(fileno(stdout));
+    stderr_is_tty = isatty(fileno(stderr));
+#endif
+
     cfg.api_key = env_or("LLM_API_KEY", LLM_API_KEY);
     if (!cfg.api_key) {
         fprintf(stderr, "error: LLM_API_KEY is not set\n");
@@ -313,12 +388,17 @@ int main(int argc, char **argv) {
     }
     cfg.base_url = env_or("LLM_BASE_URL", LLM_BASE_URL);
     cfg.model = env_or("LLM_MODEL", LLM_MODEL);
-    cfg.out = out_puts;
+    cfg.out = out_kind;
+    cfg.note = note_kind;
     cfg.stream = 1;
+    cfg.show_thought = 1;
     {
         const char *v = getenv("LLM_STREAM");
         if (v && *v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N'|| v[0] == 'f' || v[0] == 'F'))
             cfg.stream = 0;
+        v = getenv("IGOR_SHOW_THINKING");
+        if (v && *v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N'|| v[0] == 'f' || v[0] == 'F'))
+            cfg.show_thought = 0;
     }
     const char *ms = getenv("LLM_MAX_STEPS");
     cfg.max_steps = (ms && *ms) ? atoi(ms) : 16;

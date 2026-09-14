@@ -1,15 +1,28 @@
 #ifndef IGOR_AGENT_H
 #define IGOR_AGENT_H
 
+/* What a piece of output is, so the caller can make the difference visible. */
+enum {
+    IGOR_TEXT = 0, /* the model's answer */
+    IGOR_THOUGHT,  /* the model's reasoning, before it answers */
+    IGOR_NOTE,     /* igor's own trace: what it is doing */
+    IGOR_ERROR     /* something went wrong */
+};
+
 typedef struct {
     const char *api_key;
     const char *base_url;
     const char *model;
     int max_steps;
-    /* Show the answer as it is written. When NULL the answer is only returned. */
-    void (*out)(const char *text);
+    /* Answer text, with the kind from above. NULL in tests and library use. */
+    void (*out)(const char *text, int kind);
+    /* Trace and diagnostics; these belong on stderr so a piped answer stays
+     * clean. Falls back to stderr when NULL. */
+    void (*note)(const char *text, int kind);
     /* Ask the API to stream; the answer then reaches out() while it arrives. */
     int stream;
+    /* Show the model's reasoning, dimmed, instead of hiding it. */
+    int show_thought;
 } agent_config_t;
 
 /* Opaque conversation session; keeps the message history across turns. */
