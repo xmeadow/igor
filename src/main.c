@@ -14,10 +14,26 @@
 #define stdin_is_tty() _isatty(_fileno(stdin))
 #else
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <sys/time.h>
 #define stdin_is_tty() isatty(fileno(stdin))
 #endif
 
 #include "agent.h"
+
+/* The one line that says what is happening, drawn on stderr and overwritten in
+ * place; defined with the rest of the output code below. */
+static void status_show(const char *text);
+
+/* The model's answer is marked with `igor> ` where it starts, not where the
+ * request starts - otherwise the trace scrolls in under the marker and the
+ * answer has nothing in front of it. This is 0 while a request runs: the next
+ * answer text begins a segment. status_mark() sets it back whenever igor starts
+ * a new activity, so each answer block after a thought or a tool call is marked
+ * again. */
+static int answer_started = 1;
+static int stdout_tty;
 
 #ifndef LLM_API_KEY
 #define LLM_API_KEY NULL
@@ -32,6 +48,14 @@
 static const char *env_or(const char *name, const char *def) {
     const char *v = getenv(name);
     return (v && *v) ? v : def;
+}
+
+/* An env switch is on unless it is explicitly off, so `IGOR_X=1` and
+ * `IGOR_X=yes` enable it; unset or empty falls back to the default. */
+static int env_on(const char *name, int def) {
+    const char *v = getenv(name);
+    if (!v || !*v) return def;
+    return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
 }
 
 /* ---- UTF-8 aware console I/O ----
@@ -168,6 +192,7 @@ static WORD attr_for(int kind) {
     case IGOR_THOUGHT: return FOREGROUND_INTENSITY; /* dim */
     case IGOR_NOTE:    return FOREGROUND_GREEN | FOREGROUND_BLUE; /* cyan */
     case IGOR_ERROR:   return FOREGROUND_RED | FOREGROUND_INTENSITY;
+    case IGOR_PROMPT:  return FOREGROUND_GREEN | FOREGROUND_INTENSITY;
     default:           return have_default_attr ? default_attr : 7;
     }
 }
@@ -176,6 +201,7 @@ static void put_text(const char *s, int kind, int to_stderr) {
     HANDLE h = out_handle(to_stderr);
     FILE *f = to_stderr ? stderr : stdout;
 
+    status_show(NULL); /* never write into the line the status is using */
     if (is_console(h)) {
         int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
         if (n <= 0) return;
@@ -202,9 +228,10 @@ static int stdout_is_tty, stderr_is_tty;
 
 static const char *attr_for(int kind) {
     switch (kind) {
-    case IGOR_THOUGHT: return "\033[2m";  /* dim */
-    case IGOR_NOTE:    return "\033[36m"; /* cyan */
-    case IGOR_ERROR:   return "\033[31m"; /* red */
+    case IGOR_THOUGHT: return "\033[2m";   /* dim */
+    case IGOR_NOTE:    return "\033[36m";  /* cyan */
+    case IGOR_ERROR:   return "\033[1;31m"; /* red */
+    case IGOR_PROMPT:  return "\033[1;32m"; /* green */
     default:           return "";
     }
 }
@@ -213,6 +240,7 @@ static void put_text(const char *s, int kind, int to_stderr) {
     FILE *f = to_stderr ? stderr : stdout;
     int tty = to_stderr ? stderr_is_tty : stdout_is_tty;
 
+    status_show(NULL); /* never write into the line the status is using */
     if (tty && kind != IGOR_TEXT) fputs(attr_for(kind), f);
     fputs(s, f);
     if (tty && kind != IGOR_TEXT) fputs(IGOR_ATTR_RESET, f);
@@ -246,11 +274,83 @@ static void out_puts(const char *s) {
 }
 
 static void out_kind(const char *s, int kind) {
+    if (kind == IGOR_TEXT && !answer_started && stdout_tty) {
+        const char *p = s, *q = s;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q) {
+            answer_started = 1;
+            while (*p == '\n' || *p == '\r') p++; /* not before the mark */
+            put_text("\n", IGOR_TEXT, 0);
+            put_text("igor> ", IGOR_PROMPT, 0);
+            s = p;
+        }
+    }
     put_text(s, kind, 0);
 }
 
 static void note_kind(const char *s, int kind) {
     put_text(s, kind, 1);
+}
+
+/* ---- the status line ----
+ *
+ * One line on stderr that is overwritten in place while a request runs, so the
+ * screen says what is happening without filling up with it. Drawn on stderr so
+ * a piped answer stays clean, and only on a terminal - everywhere else it would
+ * be noise in a log.
+ */
+static int status_drawn; /* a line is on screen right now */
+static int status_tty;
+
+static int status_columns(void) {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &info)) {
+        int w = info.dwSize.X;
+        if (w > 4) return w < 100 ? w : 100;
+    }
+#else
+    {
+        struct winsize ws;
+        if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 4)
+            return ws.ws_col < 100 ? ws.ws_col : 100;
+    }
+#endif
+    return 80;
+}
+
+/* igor is about to do something; whatever it answers next is a new block. */
+static void status_mark(const char *text) {
+    if (text) answer_started = 0;
+    status_show(text);
+}
+
+/* NULL clears the line. Called often, so it must be cheap when nothing is up. */
+static void status_show(const char *text) {
+    static int width;
+    char line[128];
+    int n, i;
+
+    if (!status_tty) return;
+    if (!text) {
+        if (!status_drawn) return;
+        status_drawn = 0;
+        text = "";
+    }
+    if (!width) width = status_columns();
+
+    n = snprintf(line, sizeof(line), "%s", text ? text : "");
+    if (n > width - 1) {
+        n = width - 1;
+        line[n] = 0;
+    }
+    fputc('\r', stderr);
+    fputs(line, stderr);
+    for (i = n; i < width - 1; i++) fputc(' ', stderr);
+    fputc('\r', stderr);
+    fflush(stderr);
+    status_drawn = (n > 0);
 }
 
 /* Read the entire remaining stdin (piped one-shot task). */
@@ -297,6 +397,7 @@ static int run_once(const agent_config_t *cfg, const char *task) {
         fprintf(stderr, "error: out of memory\n");
         return 1;
     }
+    answer_started = 1;
     char *ans = agent_chat(s, task);
     agent_session_free(s);
     int rc = ans ? 0 : 1;
@@ -320,7 +421,7 @@ static int interactive_loop(const agent_config_t *cfg) {
 
     int rc = 0;
     for (;;) {
-        out_puts("you> ");
+        out_kind("you> ", IGOR_PROMPT);
         fflush(stdout);
 
         char *line = read_line_utf8(stdin);
@@ -339,20 +440,19 @@ static int interactive_loop(const agent_config_t *cfg) {
             break;
         }
         if (strcmp(line, "/help") == 0) {
+            answer_started = 1; /* a plain notice, not an answer block */
             print_help();
             free(line);
             continue;
         }
         if (strcmp(line, "/clear") == 0) {
             agent_session_reset(s);
+            answer_started = 1; /* a plain notice, not an answer block */
             out_puts("conversation cleared\n");
             fflush(stdout);
             free(line);
             continue;
         }
-
-        out_puts("igor> ");
-        fflush(stdout);
 
         char *ans = agent_chat(s, line);
         free(line);
@@ -375,10 +475,14 @@ int main(int argc, char **argv) {
             default_attr = info.wAttributes;
             have_default_attr = 1;
         }
+        status_tty = is_console(GetStdHandle(STD_ERROR_HANDLE));
+        stdout_tty = is_console(GetStdHandle(STD_OUTPUT_HANDLE));
     }
 #else
     stdout_is_tty = isatty(fileno(stdout));
     stderr_is_tty = isatty(fileno(stderr));
+    status_tty = stderr_is_tty;
+    stdout_tty = stdout_is_tty;
 #endif
 
     cfg.api_key = env_or("LLM_API_KEY", LLM_API_KEY);
@@ -390,16 +494,11 @@ int main(int argc, char **argv) {
     cfg.model = env_or("LLM_MODEL", LLM_MODEL);
     cfg.out = out_kind;
     cfg.note = note_kind;
-    cfg.stream = 1;
-    cfg.show_thought = 1;
-    {
-        const char *v = getenv("LLM_STREAM");
-        if (v && *v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N'|| v[0] == 'f' || v[0] == 'F'))
-            cfg.stream = 0;
-        v = getenv("IGOR_SHOW_THINKING");
-        if (v && *v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N'|| v[0] == 'f' || v[0] == 'F'))
-            cfg.show_thought = 0;
-    }
+    cfg.status = status_mark;
+    cfg.stream = env_on("LLM_STREAM", 1);
+    /* Off by default: shown in full, the reasoning buries the answer. It is
+     * still reachable for debugging with IGOR_SHOW_THINKING=1. */
+    cfg.show_thought = env_on("IGOR_SHOW_THINKING", 0);
     const char *ms = getenv("LLM_MAX_STEPS");
     cfg.max_steps = (ms && *ms) ? atoi(ms) : 16;
     if (cfg.max_steps <= 0) cfg.max_steps = 16;

@@ -50,7 +50,7 @@ Via environment variables (same on every OS):
 | `LLM_MAX_STEPS`| `16`                          | Tool-using iterations before the agent is asked to summarise |
 | `IGOR_COMMAND_TIMEOUT` | `120`                 | Seconds a shell command may run (Win32) |
 | `LLM_STREAM`   | `1`                           | Show the answer while it is being written |
-| `IGOR_SHOW_THINKING` | `1`                     | Show the model's reasoning, dimmed |
+| `IGOR_SHOW_THINKING` | `0`                     | Print the model's reasoning, dimmed, instead of only ticking it in the status line |
 
 Defaults can also be baked in at compile time with `make LLM_API_KEY=... LLM_BASE_URL=... LLM_MODEL=...`.
 
@@ -106,20 +106,44 @@ Igor writes three kinds of text and they have to stay apart:
 
 | What | Stream | How it looks |
 | --- | --- | --- |
-| the model's reasoning | stdout | dim, prefixed `[thinking]` |
-| what igor is doing | stderr | one line per tool call, prefixed `->`, cyan |
-| the answer | stdout | plain |
+| the model's reasoning | stderr | a ticker in the status line: `... thinking 4s <newest words>` |
+| what igor is doing | stderr | one line per tool call: `-> <tool>: <target> (0.4s) ok`, cyan |
+| the answer | stdout | plain, behind an `igor> ` mark |
 
-On a console the difference is colour - Windows console attributes, ANSI
-everywhere else. When the output is redirected there is no colour, so the
-`[thinking]` and `->` prefixes carry it. Reasoning is shown because otherwise
-the pause is a mystery, but it should never look like the answer: it is dimmed,
-labelled, and the answer starts on a fresh line. `IGOR_SHOW_THINKING=0` hides it.
+Every line of the transcript opens with a marker, so it stays readable without
+colour: green `you>` / `igor>` is the conversation, cyan `--` / `->` is igor's
+trace, red is a problem. On a console colour is added on top of that - Windows
+console attributes, ANSI everywhere else. When the output is redirected there
+is neither colour nor marker, so a piped answer stays clean while the trace
+keeps its text.
+
+A tool line says how it went: `ok`, or `failed` / `timed out` in red when igor
+could not carry the action out. A command that exits non-zero is still an `ok`
+call - its exit code is in the result the model reads.
+
+`igor> ` is printed where the answer *starts*, not where the request starts.
+Putting it up before the request meant the trace scrolled in underneath the mark
+and the answer had nothing in front of it. The mark reappears for every block
+the model speaks in between two tool calls, so a long run reads as a transcript
+rather than one undivided stream.
+
+Reasoning is hidden by default: written out, it buries the answer. Instead its
+newest words appear in the status line, in place, so a pause is not a mystery.
+`IGOR_SHOW_THINKING=1` prints it in full - dimmed, and with a `  . ` gutter on
+every line so it cannot be mistaken for the answer.
 
 One case cannot be told apart while it happens: a model often talks before it
 acts ("I'll search for that"), and in the protocol that text is an ordinary
 answer fragment. It is printed plain, and the tool line that follows marks it as
 preamble rather than an answer.
+
+## The status line
+
+While a request is in flight igor draws one line on stderr - `... waiting for
+the model`, `... thinking 3s <words>`, `... running edit` - and overwrites it in
+place, so the screen says what is happening without filling up with it. It is
+drawn only on a terminal: redirected, it would be noise in a log. Nothing is
+written into the line while it is up; output clears it first.
 
 ## Streaming
 

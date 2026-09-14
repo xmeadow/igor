@@ -6,7 +6,8 @@ enum {
     IGOR_TEXT = 0, /* the model's answer */
     IGOR_THOUGHT,  /* the model's reasoning, before it answers */
     IGOR_NOTE,     /* igor's own trace: what it is doing */
-    IGOR_ERROR     /* something went wrong */
+    IGOR_ERROR,    /* something went wrong */
+    IGOR_PROMPT    /* the conversation skeleton: you> and igor> */
 };
 
 typedef struct {
@@ -19,6 +20,9 @@ typedef struct {
     /* Trace and diagnostics; these belong on stderr so a piped answer stays
      * clean. Falls back to stderr when NULL. */
     void (*note)(const char *text, int kind);
+    /* One line, overwritten in place, saying what igor is doing right now.
+     * NULL clears it. Ignored when there is no terminal. */
+    void (*status)(const char *text);
     /* Ask the API to stream; the answer then reaches out() while it arrives. */
     int stream;
     /* Show the model's reasoning, dimmed, instead of hiding it. */

@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #define POPEN popen
 #define PCLOSE pclose
@@ -169,6 +170,36 @@ static void note(const agent_config_t *cfg, int kind, const char *fmt, ...) {
 
 static void say(const agent_config_t *cfg, int kind, const char *text) {
     if (cfg->out) cfg->out(text, kind);
+}
+
+static void set_status(const agent_config_t *cfg, const char *text) {
+    if (cfg->status) cfg->status(text);
+}
+
+static long now_ms(void) {
+#ifdef _WIN32
+    return (long)GetTickCount();
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long)tv.tv_sec * 1000 + (long)(tv.tv_usec / 1000);
+#endif
+}
+
+/* Keep only the last `keep` bytes, so a long line can be shown from its end. */
+static void sb_keep_tail(sb_t *b, size_t keep) {
+    size_t drop;
+    if (b->len <= keep) return;
+    drop = b->len - keep;
+    memmove(b->d, b->d + drop, b->len - drop);
+    b->len -= drop;
+}
+
+/* Reason tracks the newest words so the status line can show them in place.
+ * Newlines would break that single line, so they become spaces. */
+static void sb_append_status_text(sb_t *b, const char *s) {
+    for (; *s; s++) sb_putc(b, (*s == '\n' || *s == '\r' || *s == '\t') ? ' ' : *s);
+    sb_keep_tail(b, 96);
 }
 
 /* ---- message list ---- */
@@ -593,7 +624,13 @@ static int run_child(const char *cmd, int timeout_ms, int *exit_code, int *timed
 }
 #endif /* _WIN32 */
 
-static char *tool_run_command(const char *command) {
+/* How a tool ended, so the trace can say it in one word. `ok` means igor could
+ * carry the action out, not that the command liked its result: a command that
+ * exits non-zero is still an `ok` call, its exit code is in the result. */
+typedef enum { TOOL_OK = 0, TOOL_FAILED, TOOL_TIMEOUT } tool_status_t;
+
+static char *tool_run_command(const char *command, tool_status_t *outcome) {
+    *outcome = TOOL_OK;
     char cmd[4096];
     char prefix[600] = "";
     const char *root = getenv("SystemRoot");
@@ -617,6 +654,7 @@ static char *tool_run_command(const char *command) {
     sb_init(&raw);
     if (!run_child(cmd, timeout_ms, &code, &timed_out, &raw)) {
         sb_free(&raw);
+        *outcome = TOOL_FAILED;
         return strdup("run_command: could not start the command");
     }
 
@@ -627,12 +665,13 @@ static char *tool_run_command(const char *command) {
     else
         sb_printf(&r, "STATUS: exit code %d\n--- OUTPUT ---\n", code);
     sb_append_utf8(&r, raw.d, raw.len);
+    if (timed_out) *outcome = TOOL_TIMEOUT;
     sb_free(&raw);
     sb_term(&r);
     return r.d;
 #else
     FILE *fp = POPEN(cmd, "r");
-    if (!fp) return strdup("run_command: popen failed");
+    if (!fp) { *outcome = TOOL_FAILED; return strdup("run_command: popen failed"); }
 
     sb_t out;
     sb_init(&out);
@@ -658,7 +697,8 @@ static char *tool_run_command(const char *command) {
 /* Read a file, optionally a byte range. Binary content (a NUL byte) comes
  * back as a hex dump with absolute offsets, so the model can walk a file it
  * cannot otherwise inspect. */
-static char *tool_read_file(const char *path, long offset, long limit) {
+static char *tool_read_file(const char *path, long offset, long limit, tool_status_t *outcome) {
+    *outcome = TOOL_FAILED;
     FILE *f = fopen(path, "rb");
     if (!f) return strdup("read_file: could not open file");
 
@@ -700,16 +740,19 @@ static char *tool_read_file(const char *path, long offset, long limit) {
     }
     sb_free(&out);
     sb_term(&r);
+    *outcome = TOOL_OK;
     return r.d;
 }
 
-static char *tool_write_file(const char *path, const char *content) {
+static char *tool_write_file(const char *path, const char *content, tool_status_t *outcome) {
+    *outcome = TOOL_FAILED;
     FILE *f = fopen(path, "wb");
     if (!f) return strdup("write_file: could not create file");
     size_t n = strlen(content);
     size_t w = fwrite(content, 1, n, f);
     fclose(f);
     if (w != n) return strdup("write_file: short write");
+    *outcome = TOOL_OK;
     return strdup("ok");
 }
 
@@ -733,10 +776,14 @@ typedef struct {
     const agent_config_t *cfg;
     sb_t line;     /* the event line being received */
     sb_t content;  /* the answer so far */
+    sb_t reason;   /* the newest words of the reasoning, for the status line */
     tc_frag_t *frags;
     int nfrags, cap;
     int printed;      /* answer text reached out() */
-    int thought_open; /* a [thinking] block is open */
+    int thought_open; /* a reasoning block is open */
+    int thought_line_start; /* the next reasoning byte begins a line */
+    long started;     /* when this turn began, for the elapsed time */
+    long last_status; /* when the status line was last redrawn */
     int done;         /* the stream said [DONE] */
 } stream_t;
 
@@ -744,17 +791,22 @@ static void stream_init(stream_t *st, const agent_config_t *cfg) {
     st->cfg = cfg;
     sb_init(&st->line);
     sb_init(&st->content);
+    sb_init(&st->reason);
     st->frags = NULL;
     st->nfrags = 0;
     st->cap = 0;
     st->printed = 0;
     st->thought_open = 0;
+    st->thought_line_start = 1;
+    st->started = now_ms();
+    st->last_status = 0;
     st->done = 0;
 }
 
 static void stream_free(stream_t *st) {
     sb_free(&st->line);
     sb_free(&st->content);
+    sb_free(&st->reason);
     for (int i = 0; i < st->nfrags; i++) {
         sb_free(&st->frags[i].name);
         sb_free(&st->frags[i].args);
@@ -786,11 +838,11 @@ static tc_frag_t *stream_frag(stream_t *st, int index) {
     }
 }
 
-/* Close an open reasoning block, so the answer starts on its own line. */
+/* Close a reasoning block, so whatever comes next starts on its own line. */
 static void stream_close_thought(stream_t *st) {
     if (!st->thought_open) return;
     st->thought_open = 0;
-    say(st->cfg, IGOR_TEXT, "\n");
+    if (!st->thought_line_start) say(st->cfg, IGOR_THOUGHT, "\n");
 }
 
 /* One `data:` payload: a partial answer, a partial tool call, or [DONE]. */
@@ -811,18 +863,47 @@ static void stream_event(stream_t *st, const char *json) {
     delta = json_path(root, "choices.0.delta");
     if (delta) {
         const char *think = json_str(json_get(delta, "reasoning_content"));
-        if (think && *think && st->cfg->show_thought) {
-            /* The model reasons before it answers. Hidden, the pause looks like
-             * a hang; shown, it must not look like the answer. */
-            if (!st->thought_open) {
-                st->thought_open = 1;
-                say(st->cfg, IGOR_THOUGHT, "[thinking] ");
+        if (think && *think) {
+            /* The model reasons before it answers. Shown in full it buries the
+             * answer, so by default only its newest words appear, in place in
+             * the status line; IGOR_SHOW_THINKING=1 prints the lot. */
+            if (!st->cfg->show_thought) {
+                sb_append_status_text(&st->reason, think);
+                if (now_ms() - st->last_status >= 120) {
+                    char line[256];
+                    snprintf(line, sizeof(line), "... thinking %.0fs  %s",
+                             (double)(now_ms() - st->started) / 1000.0, st->reason.d);
+                    set_status(st->cfg, line);
+                    st->last_status = now_ms();
+                }
+            } else {
+                /* Opt-in: the reasoning is printed, but every line carries a
+                 * gutter so it cannot be mistaken for the answer. */
+                sb_t g;
+                const char *p;
+                if (!st->thought_open) {
+                    st->thought_open = 1;
+                    st->thought_line_start = 1;
+                    say(st->cfg, IGOR_THOUGHT, "[thinking]\n");
+                }
+                sb_init(&g);
+                for (p = think; *p; p++) {
+                    if (st->thought_line_start && *p != '\n') {
+                        sb_puts(&g, "  . ");
+                        st->thought_line_start = 0;
+                    }
+                    sb_putc(&g, *p);
+                    if (*p == '\n') st->thought_line_start = 1;
+                }
+                sb_term(&g);
+                say(st->cfg, IGOR_THOUGHT, g.d);
+                sb_free(&g);
             }
-            say(st->cfg, IGOR_THOUGHT, think);
         }
         text = json_str(json_get(delta, "content"));
         if (text && *text) {
             stream_close_thought(st);
+            set_status(st->cfg, NULL);
             sb_puts(&st->content, text);
             st->printed = 1;
             say(st->cfg, IGOR_TEXT, text);
@@ -1032,9 +1113,12 @@ static void grep_path(const char *path, grep_t *g) {
 #endif
 }
 
-static char *tool_grep(const char *pattern, const char *path, int ignore_case) {
+static char *tool_grep(const char *pattern, const char *path, int ignore_case,
+                       tool_status_t *outcome) {
     grep_t g;
     sb_t out;
+
+    *outcome = TOOL_OK;
 
     g.pattern = pattern;
     g.plen = strlen(pattern);
@@ -1065,7 +1149,7 @@ static char *tool_grep(const char *pattern, const char *path, int ignore_case) {
 #define EDIT_MAX (8 * 1024 * 1024)
 
 static char *tool_edit(const char *path, const char *find, const char *replace,
-                       int occurrence, int all) {
+                       int occurrence, int all, tool_status_t *outcome) {
     FILE *f;
     char *buf, *out;
     sb_t r;
@@ -1074,6 +1158,7 @@ static char *tool_edit(const char *path, const char *find, const char *replace,
     int count = 0, idx = 0, chosen;
     sb_t where;
 
+    *outcome = TOOL_FAILED;
     flen = strlen(find);
     rlen = strlen(replace);
     sb_init(&r);
@@ -1221,6 +1306,7 @@ static char *tool_edit(const char *path, const char *find, const char *replace,
     sb_printf(&r, "edit: replaced %d of %d match(es) in %s, first at line %ld, %lu bytes now\n",
               chosen, count, path, first_line, (unsigned long)q);
     sb_term(&r);
+    *outcome = TOOL_OK;
     return r.d;
 }
 
@@ -1232,9 +1318,12 @@ static char *run_tool(const agent_config_t *cfg, const char *name, const char *a
         return strdup("tool error: invalid arguments");
     }
 
-    /* Trace the tool call so the user can follow what the agent is doing. */
+    /* What is about to happen, in the detail that matters for this tool. */
+    const char *detail = "";
+    char statusline[192];
+    long started;
+    tool_status_t tstat = TOOL_FAILED;
     {
-        const char *detail = "";
         if (strcmp(name, "run_command") == 0) {
             const char *c = json_str(json_get(args, "command"));
             if (c) detail = c;
@@ -1246,35 +1335,40 @@ static char *run_tool(const agent_config_t *cfg, const char *name, const char *a
             const char *pat = json_str(json_get(args, "pattern"));
             if (pat) detail = pat;
         }
-        note(cfg, IGOR_NOTE, "  -> %s: %s\n", name, detail);
     }
+
+    /* The status line says it live; the trace line below reports it afterwards,
+     * with how long it took. */
+    snprintf(statusline, sizeof(statusline), "... running %s", name);
+    set_status(cfg, statusline);
+    started = now_ms();
 
     char *result = NULL;
     if (strcmp(name, "run_command") == 0) {
         const char *c = json_str(json_get(args, "command"));
-        result = c ? tool_run_command(c) : strdup("run_command: missing 'command'");
+        result = c ? tool_run_command(c, &tstat) : strdup("run_command: missing 'command'");
     } else if (strcmp(name, "read_file") == 0) {
         const char *p = json_str(json_get(args, "path"));
         long offset = (long)json_num(json_get(args, "offset"), 0);
         long limit = (long)json_num(json_get(args, "limit"), 0);
-        result = p ? tool_read_file(p, offset, limit) : strdup("read_file: missing 'path'");
+        result = p ? tool_read_file(p, offset, limit, &tstat) : strdup("read_file: missing 'path'");
     } else if (strcmp(name, "write_file") == 0) {
         const char *p = json_str(json_get(args, "path"));
         const char *c = json_str(json_get(args, "content"));
-        result = (p && c) ? tool_write_file(p, c) : strdup("write_file: missing 'path' or 'content'");
+        result = (p && c) ? tool_write_file(p, c, &tstat) : strdup("write_file: missing 'path' or 'content'");
     } else if (strcmp(name, "edit") == 0) {
         const char *p = json_str(json_get(args, "path"));
         const char *fnd = json_str(json_get(args, "find"));
         const char *rep = json_str(json_get(args, "replace"));
         int occurrence = (int)json_num(json_get(args, "occurrence"), 0);
         int all = json_bool(json_get(args, "all"), 0);
-        result = (p && fnd && rep) ? tool_edit(p, fnd, rep, occurrence, all)
+        result = (p && fnd && rep) ? tool_edit(p, fnd, rep, occurrence, all, &tstat)
                                    : strdup("edit: missing 'path', 'find' or 'replace'");
     } else if (strcmp(name, "grep") == 0) {
         const char *pat = json_str(json_get(args, "pattern"));
         const char *p = json_str(json_get(args, "path"));
         int ignore_case = json_bool(json_get(args, "ignore_case"), 0);
-        result = pat ? tool_grep(pat, p, ignore_case) : strdup("grep: missing 'pattern'");
+        result = pat ? tool_grep(pat, p, ignore_case, &tstat) : strdup("grep: missing 'pattern'");
     } else {
         sb_t b;
         sb_init(&b);
@@ -1283,7 +1377,24 @@ static char *run_tool(const agent_config_t *cfg, const char *name, const char *a
         result = b.d;
     }
 
-    json_free(args);
+    set_status(cfg, NULL);
+    {
+        /* One line, so a command that spans lines or runs long does not break
+         * the transcript. Red when the tool could not do its job. */
+        const char *how = tstat == TOOL_OK ? "ok"
+                        : tstat == TOOL_TIMEOUT ? "timed out" : "failed";
+        char d[120];
+        size_t k = 0;
+        const char *p;
+        for (p = detail; *p && k < sizeof(d) - 4; p++)
+            d[k++] = (*p == '\n' || *p == '\r' || *p == '\t') ? ' ' : *p;
+        if (*p) { d[k++] = '.'; d[k++] = '.'; d[k++] = '.'; }
+        d[k] = 0;
+        note(cfg, tstat == TOOL_OK ? IGOR_NOTE : IGOR_ERROR,
+             "  -> %s: %s (%.1fs) %s\n", name, d,
+             (double)(now_ms() - started) / 1000.0, how);
+    }
+    json_free(args); /* detail points into args, so report before freeing */
     return result;
 }
 
@@ -1751,6 +1862,7 @@ static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
     sb_term(&req);
 
     if (streaming) stream_init(&st, cfg);
+    set_status(cfg, "... waiting for the model");
 
     snprintf(url, sizeof(url), "%s/chat/completions", cfg->base_url);
     if (http_post(url, cfg->api_key, req.d, &status, &resp,
@@ -1789,6 +1901,7 @@ static int http_turn(const agent_config_t *cfg, msgs_t *msgs, int with_tools,
         *content_out = parse_response(resp, calls_out, ncalls_out);
         if (*content_out && *ncalls_out == 0) say(cfg, IGOR_TEXT, *content_out);
     }
+    set_status(cfg, NULL);
     free(resp);
     return 1;
 }
