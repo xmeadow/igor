@@ -94,6 +94,10 @@ export LLM_MODEL=your-model
 | `edit` | replace an exact snippet in a text file, instead of rewriting the whole file |
 | `grep` | find a literal string in files, recursively |
 
+No tool may return more than a quarter of `IGOR_CONTEXT_TOKENS`; anything longer
+is cut and the cut is reported, so a result is never mistaken for the whole
+story. `read_file` and `grep` can be asked for the rest in pieces.
+
 `grep` is implemented in the process rather than shelled out: the target
 platform has no `grep`, and its `findstr` has no recursive mode worth using. It
 skips hidden directories and binary files and caps its output at 100 matches
@@ -195,9 +199,19 @@ token estimate and is corrected against the `usage` the API reports with every
 answer, so the budget keeps meaning tokens whatever the text is made of. For a
 model with a bigger window, `IGOR_CONTEXT_TOKENS` is the one knob to turn.
 
-What no budget can fix: a single message larger than it. A prompt that is mostly
-preprompt and tool definitions has nothing left to drop, and one file read can
-be big enough on its own.
+What no budget can fix by dropping turns: a message that is too big on its own.
+It is the newest, so there is nothing older to drop, and the prompt that is
+mostly preprompt and tool definitions has nothing droppable at all. So the tools
+are bounded as well: no single result may take more than a quarter of the
+budget. `read_file` reads a range of that size unless told otherwise and says
+which bytes came back, so fetching the rest is a follow-up call. A result that
+another tool produces and that is longer gets cut, with a line saying so - a
+silent cut would be worse than no result, because a prefix reads exactly like
+the whole thing.
+
+Command output is bounded the same way, at 1 MiB, but the command is left to
+run to the end: the exit code stays real and only what is kept is limited. What
+was cut is reported either way.
 
 ### What a request cost
 

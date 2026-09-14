@@ -321,6 +321,45 @@ static long request_tokens_raw(const msgs_t *m, int from, int with_tools) {
     return n;
 }
 
+/* A single tool result gets a share of the budget, because a result that is too
+ * big on its own cannot be trimmed away: it is the newest message, and dropping
+ * older ones only makes it loom larger. A quarter of the budget leaves room for
+ * several results in one turn plus the rest of the conversation. */
+#define RESULT_SHARE 4
+#define RESULT_MAX_FALLBACK 24000 /* budget turned off: still not unbounded */
+
+static size_t result_max(const agent_config_t *cfg) {
+    long bytes;
+    if (cfg->context_tokens <= 0) return RESULT_MAX_FALLBACK;
+    bytes = (cfg->context_tokens / RESULT_SHARE) * EST_CHARS_PER_TOKEN;
+    if (bytes < 2000) bytes = 2000; /* a result smaller than that helps nobody */
+    return (size_t)bytes;
+}
+
+/* Cap a tool result, and say so - a silent cut is worse than no result, because
+ * the model reads a prefix as if it were the whole thing. Takes ownership of s
+ * and returns what to send instead, so the common case does not copy.
+ *
+ * The cut falls on a UTF-8 boundary: a truncated multi-byte sequence is not
+ * valid UTF-8, and the API rejects the entire request over it, which would land
+ * far away from here. */
+static char *result_cap(char *s, size_t max) {
+    size_t n = strlen(s);
+    sb_t b;
+
+    if (n <= max) return s;
+    while (max > 0 && ((unsigned char)s[max] & 0xC0) == 0x80) max--;
+
+    sb_init(&b);
+    sb_append_n(&b, s, max);
+    sb_printf(&b, "\n--- result cut off at %lu bytes, it was longer; use offset and limit,"
+                  " or a narrower pattern, for the rest ---\n",
+              (unsigned long)max);
+    sb_term(&b);
+    free(s);
+    return b.d;
+}
+
 /* ---- request building ---- */
 static void build_request(sb_t *b, const agent_config_t *cfg, msg_t *msgs, int nmsg,
                           int with_tools, int include_usage) {
@@ -481,6 +520,22 @@ static void sb_put_hex_dump(sb_t *b, const char *s, size_t len, long base) {
 
 /* ---- tools ---- */
 
+/* Keep what fits and remember that the rest was dropped. The caller keeps
+ * reading either way: a child that is not drained blocks on a full pipe, and
+ * killing it would throw away the exit code. Only the keeping is bounded, so a
+ * command that prints a gigabyte does not become a gigabyte of memory. */
+static void keep_upto(sb_t *out, const char *data, size_t n, int *capped) {
+    if (out->len < MAX_READ) {
+        size_t room = MAX_READ - out->len;
+        if (n <= room) {
+            sb_append_n(out, data, n);
+            return;
+        }
+        sb_append_n(out, data, room);
+    }
+    *capped = 1;
+}
+
 #ifdef _WIN32
 /* Command timeout: a command that never returns (a script waiting on a dead
  * network call, say) would otherwise hang the agent for good and leave a
@@ -581,7 +636,8 @@ static void kill_child(HANDLE job, HANDLE process, DWORD pid) {
 
 /* Run cmd through cmd.exe, capturing stdout+stderr. Returns 0 when the
  * process could not be started; otherwise fills *exit_code and *timed_out. */
-static int run_child(const char *cmd, int timeout_ms, int *exit_code, int *timed_out, sb_t *out) {
+static int run_child(const char *cmd, int timeout_ms, int *exit_code, int *timed_out,
+                     int *capped, sb_t *out) {
     SECURITY_ATTRIBUTES sa;
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -594,6 +650,7 @@ static int run_child(const char *cmd, int timeout_ms, int *exit_code, int *timed
 
     *exit_code = -1;
     *timed_out = 0;
+    *capped = 0;
 
     sa.nLength = sizeof(sa);
     sa.lpSecurityDescriptor = NULL;
@@ -638,16 +695,11 @@ static int run_child(const char *cmd, int timeout_ms, int *exit_code, int *timed
             got = 0;
             if (avail > sizeof(tmp)) avail = sizeof(tmp);
             if (ReadFile(rd, tmp, avail, &got, NULL) && got > 0) {
-                sb_append_n(out, tmp, got);
+                keep_upto(out, tmp, (size_t)got, capped);
                 continue;
             }
         }
         if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
-        if (out->len > MAX_READ) {
-            kill_child(job, pi.hProcess, pi.dwProcessId);
-            stop = 1;
-            break;
-        }
         if (GetTickCount() - start >= (DWORD)timeout_ms) {
             *timed_out = 1;
             kill_child(job, pi.hProcess, pi.dwProcessId);
@@ -659,13 +711,13 @@ static int run_child(const char *cmd, int timeout_ms, int *exit_code, int *timed
     WaitForSingleObject(pi.hProcess, 5000);
 
     /* Drain what the pipe still holds, now that nothing else writes to it. */
-    while (out->len < MAX_READ) {
+    for (;;) {
         avail = 0;
         if (!PeekNamedPipe(rd, NULL, 0, NULL, &avail, NULL) || avail == 0) break;
         got = 0;
         if (avail > sizeof(tmp)) avail = sizeof(tmp);
         if (!ReadFile(rd, tmp, avail, &got, NULL) || got == 0) break;
-        sb_append_n(out, tmp, got);
+        keep_upto(out, tmp, (size_t)got, capped);
     }
 
     if (GetExitCodeProcess(pi.hProcess, &code)) *exit_code = (int)code;
@@ -702,10 +754,10 @@ static char *tool_run_command(const char *command, tool_status_t *outcome) {
 
 #ifdef _WIN32
     sb_t raw, r;
-    int code = -1, timed_out = 0, timeout_ms = command_timeout_ms();
+    int code = -1, timed_out = 0, capped = 0, timeout_ms = command_timeout_ms();
 
     sb_init(&raw);
-    if (!run_child(cmd, timeout_ms, &code, &timed_out, &raw)) {
+    if (!run_child(cmd, timeout_ms, &code, &timed_out, &capped, &raw)) {
         sb_free(&raw);
         *outcome = TOOL_FAILED;
         return strdup("run_command: could not start the command");
@@ -715,6 +767,9 @@ static char *tool_run_command(const char *command, tool_status_t *outcome) {
     if (timed_out)
         sb_printf(&r, "STATUS: killed after %d s, the command did not finish\n--- OUTPUT ---\n",
                   timeout_ms / 1000);
+    else if (capped)
+        sb_printf(&r, "STATUS: exit code %d; output passed %d bytes and was cut off there\n"
+                      "--- OUTPUT ---\n", code, MAX_READ);
     else
         sb_printf(&r, "STATUS: exit code %d\n--- OUTPUT ---\n", code);
     sb_append_utf8(&r, raw.d, raw.len);
@@ -724,22 +779,25 @@ static char *tool_run_command(const char *command, tool_status_t *outcome) {
     return r.d;
 #else
     FILE *fp = POPEN(cmd, "r");
+    int capped = 0;
     if (!fp) { *outcome = TOOL_FAILED; return strdup("run_command: popen failed"); }
 
     sb_t out;
     sb_init(&out);
     char tmp[1024];
     size_t n;
-    while ((n = fread(tmp, 1, sizeof(tmp), fp)) > 0) {
-        if (out.len + n > MAX_READ) break;
-        sb_append_n(&out, tmp, n);
-    }
+    while ((n = fread(tmp, 1, sizeof(tmp), fp)) > 0)
+        keep_upto(&out, tmp, n, &capped);
     int st = PCLOSE(fp);
     int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 
     sb_t r;
     sb_init(&r);
-    sb_printf(&r, "STATUS: exit code %d\n--- OUTPUT ---\n", code);
+    if (capped)
+        sb_printf(&r, "STATUS: exit code %d; output passed %d bytes and was cut off there\n"
+                      "--- OUTPUT ---\n", code, MAX_READ);
+    else
+        sb_printf(&r, "STATUS: exit code %d\n--- OUTPUT ---\n", code);
     sb_append_utf8(&r, out.d, out.len);
     sb_free(&out);
     sb_term(&r);
@@ -750,16 +808,33 @@ static char *tool_run_command(const char *command, tool_status_t *outcome) {
 /* Read a file, optionally a byte range. Binary content (a NUL byte) comes
  * back as a hex dump with absolute offsets, so the model can walk a file it
  * cannot otherwise inspect. */
-static char *tool_read_file(const char *path, long offset, long limit, tool_status_t *outcome) {
+/* Room in the result for this tool's own header and range line. Without it the
+ * header would push the result past the cap in run_tool and the content would
+ * be cut a second time, with a note contradicting the range line. A hex dump
+ * still inflates the result, so that case falls to the cap in run_tool. */
+#define READ_HEADER_ROOM 256
+
+/* Read a file, optionally a byte range. Binary content (a NUL byte) comes
+ * back as a hex dump with absolute offsets, so the model can walk a file it
+ * cannot otherwise inspect. */
+static char *tool_read_file(const char *path, long offset, long limit, long max,
+                           tool_status_t *outcome) {
+    long size = 0, content_max;
+    FILE *f;
+
     *outcome = TOOL_FAILED;
-    FILE *f = fopen(path, "rb");
+    f = fopen(path, "rb");
     if (!f) return strdup("read_file: could not open file");
 
-    long size = 0;
+    content_max = max - READ_HEADER_ROOM;
+    if (content_max < 256) content_max = 256;
     if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
     if (offset < 0) offset = 0;
     if (offset > size) offset = size;
-    if (limit <= 0 || limit > MAX_READ) limit = MAX_READ;
+    /* Asking for a bigger range does not buy a bigger answer, it only buys a
+     * request the API will reject. Reading less is why offset and limit are
+     * there; the reply says which bytes came back. */
+    if (limit <= 0 || limit > content_max) limit = content_max;
     if (fseek(f, offset, SEEK_SET) != 0) {
         fclose(f);
         return strdup("read_file: could not seek there");
@@ -1397,6 +1472,7 @@ static char *run_tool(const agent_config_t *cfg, const char *name, const char *a
     const char *detail = "";
     char statusline[192];
     long started;
+    size_t rmax = result_max(cfg);
     tool_status_t tstat = TOOL_FAILED;
     {
         if (strcmp(name, "run_command") == 0) {
@@ -1426,7 +1502,8 @@ static char *run_tool(const agent_config_t *cfg, const char *name, const char *a
         const char *p = json_str(json_get(args, "path"));
         long offset = (long)json_num(json_get(args, "offset"), 0);
         long limit = (long)json_num(json_get(args, "limit"), 0);
-        result = p ? tool_read_file(p, offset, limit, &tstat) : strdup("read_file: missing 'path'");
+        result = p ? tool_read_file(p, offset, limit, (long)rmax, &tstat)
+                   : strdup("read_file: missing 'path'");
     } else if (strcmp(name, "write_file") == 0) {
         const char *p = json_str(json_get(args, "path"));
         const char *c = json_str(json_get(args, "content"));
@@ -1453,6 +1530,8 @@ static char *run_tool(const agent_config_t *cfg, const char *name, const char *a
     }
 
     set_status(cfg, NULL);
+    /* Whatever a tool produced, it may not exceed what one message may carry. */
+    result = result_cap(result, rmax);
     {
         /* One line, so a command that spans lines or runs long does not break
          * the transcript. Red when the tool could not do its job. */
