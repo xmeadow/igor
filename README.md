@@ -177,6 +177,36 @@ part of the system prompt. Cloning a repository therefore also brings its
 instructions to your agent. Read an `AGENTS.md` you did not write before you run
 igor next to it.
 
+### Skills
+
+A skill is a directory holding a `SKILL.md`: a description of when it applies,
+and a body with the instructions.
+
+```
+.igor/skills/pdf-forms/SKILL.md
+```
+
+```markdown
+---
+name: pdf-forms
+description: Fill in PDF forms from a CSV. Use when the task involves a PDF form.
+---
+
+1. Read the CSV and ...
+```
+
+The names and descriptions go into the system message; the model reads a body
+with `read_file` when the description fits the task, and follows it. That is what
+makes this cheap: a skill costs one line until it is needed.
+
+Looked up in `.igor/skills` and `.agents/skills`, in the working directory or up
+to eight parents, closest first. At most 32 skills, descriptions cut at 200
+characters, and the frontmatter is parsed loosely - without it, the first
+non-empty line serves as the description.
+
+The trust warning above applies here too: a skill is instruction from the
+repository.
+
 ## Project layout
 
 ```

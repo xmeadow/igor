@@ -60,6 +60,7 @@ static const char *SYSTEM_PROMPT =
     "- Inspect the real state of things (read files, run commands) instead of guessing.\n"
     "- When project instructions are given above, they describe this project's conventions; follow"
     " them unless they conflict with these rules or with what you can verify.\n"
+    "- When a listed skill matches the task, read its file first and do what it says.\n"
     "- Make small, focused changes; do not refactor unrelated code.\n"
     "- Verify your work by running the build or tests when available.\n"
     "- Fix the root cause, not the symptom.\n"
@@ -1368,12 +1369,13 @@ static void system_tools_dir(char *buf, size_t len) {
     else buf[0] = 0;
 }
 
-#ifdef _WIN32
-#define TOOLS_LIST_MAX 300
-
+/* Sort directory listings, which arrive in no useful order. */
 static int name_cmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
+
+#ifdef _WIN32
+#define TOOLS_LIST_MAX 300
 
 /* List the programs in the system directory. Without this the model reasons
  * about a normal Windows machine and reaches for curl, wget or PowerShell -
@@ -1485,6 +1487,160 @@ static void sb_append_project_file(sb_t *b, const char *path) {
     free(buf);
 }
 
+/* ---- skills ----
+ *
+ * A skill is a directory holding a SKILL.md: a one-line description of when it
+ * applies, and a body with the instructions. Only the descriptions go into the
+ * system message; the model reads the body with read_file when one fits. Plain
+ * files, so a capability can be added without rebuilding igor - and the same
+ * shape as the cross-agent convention.
+ */
+#define SKILLS_MAX 32
+#define SKILL_DESC_MAX 200
+#define SKILL_HEAD_MAX 4096
+
+/* Values in the frontmatter may be quoted; trim and unquote in place. */
+static void tidy_value(char *s) {
+    size_t n;
+
+    while (*s == ' ' || *s == '\t') memmove(s, s + 1, strlen(s));
+    n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n'))
+        s[--n] = 0;
+    n = strlen(s);
+    if (n >= 2 && ((s[0] == '"' && s[n - 1] == '"') || (s[0] == '\'' && s[n - 1] == '\''))) {
+        memmove(s, s + 1, n - 2);
+        s[n - 2] = 0;
+    }
+}
+
+/* Pull name and description out of a SKILL.md. Without frontmatter the first
+ * non-empty line serves as the description. */
+static void read_skill_head(const char *path, char *name, size_t namelen,
+                            char *desc, size_t desclen) {
+    char buf[SKILL_HEAD_MAX + 1];
+    char *p;
+    FILE *f = fopen(path, "rb");
+    size_t n;
+    int in_front = 0, seen_front = 0, done = 0;
+
+    name[0] = desc[0] = 0;
+    if (!f) return;
+    n = fread(buf, 1, SKILL_HEAD_MAX, f);
+    fclose(f);
+    buf[n] = 0;
+
+    p = buf;
+    while (*p && !done) {
+        char *line = p, *nl = strchr(p, '\n'), *colon;
+        if (nl) *nl = 0;
+        p = nl ? nl + 1 : p + strlen(p);
+
+        tidy_value(line);
+        if (!*line) continue;
+        if (!seen_front && strcmp(line, "---") == 0) {
+            in_front = seen_front = 1;
+            continue;
+        }
+        if (in_front) {
+            if (strcmp(line, "---") == 0) {
+                in_front = 0;
+                if (name[0] || desc[0]) done = 1;
+                continue;
+            }
+            colon = strchr(line, ':');
+            if (!colon) continue;
+            *colon = 0;
+            tidy_value(line);
+            if (strcmp(line, "name") == 0 && !name[0]) {
+                snprintf(name, namelen, "%s", colon + 1);
+                tidy_value(name);
+            } else if (strcmp(line, "description") == 0 && !desc[0]) {
+                snprintf(desc, desclen, "%s", colon + 1);
+                tidy_value(desc);
+            }
+            continue;
+        }
+        /* No frontmatter after all: the first real line is the summary. */
+        snprintf(desc, desclen, "%s", line);
+        done = 1;
+    }
+}
+
+/* The nearest skills directory, or NULL. */
+static char *find_skills_dir(const char *cwd) {
+    static const char *names[] = {".igor/skills", ".agents/skills"};
+    char dir[1024], prev[1024];
+    int level, i;
+
+    snprintf(dir, sizeof(dir), "%s", cwd);
+    strip_trailing_sep(dir);
+    for (level = 0; level < 8; level++) {
+        for (i = 0; i < 2; i++) {
+            char path[1200];
+            snprintf(path, sizeof(path), "%s%c%s", dir, DIR_SEP, names[i]);
+            if (is_dir(path)) return strdup(path);
+        }
+        snprintf(prev, sizeof(prev), "%s", dir);
+        dir_up(dir);
+        if (strcmp(prev, dir) == 0) break;
+    }
+    return NULL;
+}
+
+/* One line per skill: name, description, and where its body sits. */
+static int sb_append_skills(sb_t *b, const char *dir) {
+    char *listing[SKILLS_MAX];
+    int n = 0, i;
+#ifdef _WIN32
+    {
+        char pattern[1200];
+        WIN32_FIND_DATAA fd;
+        HANDLE h;
+        snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+        h = FindFirstFileA(pattern, &fd);
+        if (h == INVALID_HANDLE_VALUE) return 0;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (fd.cFileName[0] == '.') continue;
+            listing[n] = strdup(fd.cFileName);
+            if (listing[n]) n++;
+        } while (n < SKILLS_MAX && FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    {
+        DIR *d = opendir(dir);
+        struct dirent *e;
+        if (!d) return 0;
+        while (n < SKILLS_MAX && (e = readdir(d))) {
+            char path[1200];
+            if (e->d_name[0] == '.') continue;
+            snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+            if (!is_dir(path)) continue;
+            listing[n] = strdup(e->d_name);
+            if (listing[n]) n++;
+        }
+        closedir(d);
+    }
+#endif
+
+    qsort(listing, (size_t)n, sizeof(listing[0]), name_cmp);
+
+    for (i = 0; i < n; i++) {
+        char path[1400], name[128], desc[SKILL_DESC_MAX + 1];
+        snprintf(path, sizeof(path), "%s%c%s%cSKILL.md", dir, DIR_SEP, listing[i], DIR_SEP);
+        read_skill_head(path, name, sizeof(name), desc, sizeof(desc));
+        if (!desc[0]) {
+            free(listing[i]);
+            continue;
+        }
+        sb_printf(b, "- %s: %s (%s)\n", name[0] ? name : listing[i], desc, path);
+        free(listing[i]);
+    }
+    return n;
+}
+
 static int add_system_message(const agent_config_t *cfg, msgs_t *m) {
     char cwdbuf[1024], tools_dir[1024];
     const char *cwd = GETCWD(cwdbuf, sizeof(cwdbuf)) ? cwdbuf : "(unknown)";
@@ -1510,6 +1666,22 @@ static int add_system_message(const agent_config_t *cfg, msgs_t *m) {
         sb_append_project_file(&sys, pfile);
         note(cfg, IGOR_NOTE, "  -- project instructions: %s\n", pfile);
         free(pfile);
+    }
+
+    /* Only the descriptions go in; the bodies are read on demand. */
+    char *skdir = find_skills_dir(cwd);
+    if (skdir) {
+        sb_t skills;
+        sb_init(&skills);
+        int found = sb_append_skills(&skills, skdir);
+        if (found > 0) {
+            sb_printf(&sys, "\nSkills in %s - read one with read_file when its description\n"
+                           "matches the task, and follow it:\n", skdir);
+            sb_puts(&sys, skills.d);
+            note(cfg, IGOR_NOTE, "  -- %d skill%s from %s\n", found, found == 1 ? "" : "s", skdir);
+        }
+        sb_free(&skills);
+        free(skdir);
     }
 
     sb_printf(&sys, "\n%s", SYSTEM_PROMPT);
