@@ -13,17 +13,27 @@ th    { background: #e8e8e8; }
 h1    { font-size: 22px; margin-bottom: 2px; }
 h2    { font-size: 15px; margin-top: 24px; }
 tt    { font-family: "Courier New", Courier, monospace; }
+.page { width: 640px; margin-left: auto; margin-right: auto; text-align: left; }
 .sub  { color: #555555; margin-top: 0px; }
+.cap  { color: #555555; font-size: 11px; margin-top: 4px; }
 .foot { color: #555555; font-size: 12px; }
 </style>
 </head>
 
 <body bgcolor="#ffffff" text="#000000" link="#0000cc" vlink="#551a8b">
 
-<table border="0" cellspacing="0" cellpadding="0" width="640"><tr><td>
+<!-- <center> and align="center" are here for the old browsers this page is
+     meant for; the .page margins do the same for everything newer. -->
+<center>
+<table class="page" border="0" cellspacing="0" cellpadding="0" width="640" align="center">
+<tr><td>
 
 <h1>igor</h1>
 <p class="sub">A small coding agent for Win32 / ReactOS, and for Linux.</p>
+
+<p><img src="screenshot-small.png" width="640" height="479" border="1"
+        alt="igor running in a console window on ReactOS"></p>
+<p class="cap">igor on ReactOS 0.4.16.</p>
 
 <h2>Download the latest release</h2>
 
@@ -84,7 +94,9 @@ Which one [1]:
 <p class="foot">igor is MIT licensed. The binaries above are built from the
 tagged source by GitHub Actions.</p>
 
-</td></tr></table>
+</td></tr>
+</table>
+</center>
 
 </body>
 </html>

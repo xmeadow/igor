@@ -2,37 +2,43 @@
 
 [![build](https://github.com/xmeadow/igor/actions/workflows/build.yml/badge.svg)](https://github.com/xmeadow/igor/actions/workflows/build.yml)
 
-A minimal, dependency-free coding agent written in **C**. Primary target is
-**Win32 (ReactOS)**, but the same source builds and runs on Linux too.
+A small coding agent you talk to in a terminal. You say what you want done;
+igor reads your files, runs commands, changes code and tells you what it did.
 
-The agent drives an LLM in a loop, runs shell commands through the native
-process API (`CreateProcess` on Windows, `popen` on Linux), and lets the model
-read and write files — so it can compile and iterate on code with
-`gcc`/`mingw32` on ReactOS.
+![igor running in a console window on ReactOS](docs/screenshot.png)
 
-## Contents
+## Start here
 
-- [Design](#design)
-- [Requirements](#requirements)
-- [Build](#build)
-- [First run](#first-run)
-- [Configuration](#configuration)
-- [Usage](#usage)
-  - [Other OpenAI-compatible providers](#other-openai-compatible-providers)
-- [Tools](#tools)
-- [Telling thought, work and answer apart](#telling-thought-work-and-answer-apart)
-- [The status line](#the-status-line)
-- [Streaming](#streaming)
-- [The conversation](#the-conversation)
-  - [Staying inside the window](#staying-inside-the-window)
-  - [What a request cost](#what-a-request-cost)
-- [How it works](#how-it-works)
-- [Prep prompt](#prep-prompt)
-  - [Project instructions](#project-instructions)
-  - [Skills](#skills)
-- [Project layout](#project-layout)
-- [ReactOS / Win32 notes](#reactos--win32-notes)
-- [License](#license)
+igor is a single program with nothing to install and no runtime to set up. What
+it does need is an account with a language-model provider - OpenAI, DeepSeek,
+Mistral and anything else speaking the same protocol all work - and an API key
+from them.
+
+1. **Get it.** Download it from the
+   [latest release](https://github.com/xmeadow/igor/releases/latest):
+   `igor-win32-i686.exe` for Windows or ReactOS, `igor-linux-x86_64` for Linux.
+   There is also a [download page](https://xmeadow.github.io/igor/) that an old
+   browser can handle. Or build it yourself - see [Build](#build).
+2. **Start it.** The first run asks which provider you use and for your key,
+   then remembers both. Nothing to edit, no files to create.
+3. **Ask for something.**
+
+```
+you> what does main.c do, and is there a bug in it?
+```
+
+That is all of it. `igor --help` lists the rest, and the sections below are how
+it works and why - worth reading when you want to know, safe to skip when you
+do not.
+
+### What it is made of
+
+A dependency-free agent written in **C**. The primary target is **Win32
+(ReactOS)**, but the same source builds and runs on Linux too. It drives a
+language model in a loop, runs shell commands through the native process API
+(`CreateProcess` on Windows, `popen` on Linux) and lets the model read and
+write files - so it can compile and iterate on code with `gcc`/`mingw32` on
+ReactOS.
 
 ## Design
 
