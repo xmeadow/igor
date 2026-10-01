@@ -26,8 +26,12 @@ jobs:
       - name: Collect the binaries
         run: |
           mkdir dist
-          cp igor     "dist/igor-${GITHUB_REF_NAME}-linux-x86_64"
-          cp igor.exe "dist/igor-${GITHUB_REF_NAME}-win32-i686.exe"
+          # The names carry no version on purpose: that is what makes
+          # /releases/latest/download/<name> a link the download page can
+          # keep without being edited for every release. The version is the
+          # release itself, and `igor --version` says it too.
+          cp igor     dist/igor-linux-x86_64
+          cp igor.exe dist/igor-win32-i686.exe
           # From inside dist, so the names in the file are the names the
           # assets have once downloaded - `sha256sum -c` works where they land.
           cd dist && sha256sum igor-* > SHA256SUMS
