@@ -4,8 +4,8 @@ WINCC ?= i686-w64-mingw32-gcc
 CFLAGS ?= -O2
 CFLAGS += -std=c11 -Wall -Wextra
 
-SRC = src/main.c src/agent.c src/http.c src/json.c
-HDR = src/agent.h src/http.h src/json.h
+SRC = src/main.c src/agent.c src/http.c src/json.c src/config.c
+HDR = src/agent.h src/http.h src/json.h src/config.h
 
 # Optional compile-time defaults (baked into the binary; env vars still win).
 ifneq ($(strip $(LLM_API_KEY)),)

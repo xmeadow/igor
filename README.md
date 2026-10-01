@@ -15,6 +15,7 @@ read and write files — so it can compile and iterate on code with
 - [Design](#design)
 - [Requirements](#requirements)
 - [Build](#build)
+- [First run](#first-run)
 - [Configuration](#configuration)
 - [Usage](#usage)
   - [Other OpenAI-compatible providers](#other-openai-compatible-providers)
@@ -63,13 +64,54 @@ make win32      # 32-bit Win32 .exe (uses WinHTTP for HTTPS)
 
 The native binary is `igor`; the Win32 binary is `igor.exe`.
 
+## First run
+
+igor needs an API key for some language model. Started from a terminal without
+one, it asks instead of refusing:
+
+```
+igor needs an API key for a language model before it can do
+anything. This asks once and remembers the answers.
+
+  1) OpenAI
+  2) DeepSeek
+  3) Mistral
+  4) OpenRouter
+  5) A local server (Ollama, llama.cpp, ...)
+  6) Something else
+
+Which one [1]:
+```
+
+Picking a provider fills in its base URL and a default model, so the usual case
+is one keypress and a pasted key. The key is not echoed while it is typed. The
+answers are written to a file and the chat starts; the next run reads them and
+asks nothing.
+
+`igor --setup` goes through the same questions again, as does `/setup` in an
+interactive session - that one takes effect immediately, without a restart.
+
 ## Configuration
 
-Via environment variables (same on every OS):
+A setting is looked for in the environment first, then in the file the setup
+wrote, then in the built-in default. The environment therefore wins for a single
+run without disturbing what was set up once.
+
+The file lives where the platform keeps per-user configuration - not in the
+working directory, which is often a repository that would carry the key away:
+
+| Platform | Path |
+| --- | --- |
+| Linux, ReactOS with a home | `$XDG_CONFIG_HOME/igor/config`, else `~/.config/igor/config` |
+| Windows  | `%APPDATA%\igor\config`, else `%USERPROFILE%\.igor\config` |
+
+It is a plain list of `NAME = value` lines using the names below, `#` starts a
+comment, and on POSIX it is created readable only by its owner. Any of these
+settings can be put there, not just the three the setup asks about:
 
 | Variable       | Default                       | Purpose                              |
 | -------------- | ----------------------------- | ------------------------------------ |
-| `LLM_API_KEY`  | *(required)*                  | API key for the LLM provider          |
+| `LLM_API_KEY`  | *(asked for on first run)*    | API key for the LLM provider          |
 | `LLM_BASE_URL` | `https://api.openai.com/v1`   | Base URL of the OpenAI-compatible API |
 | `LLM_MODEL`    | `gpt-4o-mini`                 | Model name                           |
 | `LLM_MAX_STEPS`| `16`                          | Tool-using iterations before the agent is asked to summarise |
@@ -92,12 +134,15 @@ Defaults can also be baked in at compile time with `make LLM_API_KEY=... LLM_BAS
 
 # one-shot from stdin
 echo "find the bug in main.c and fix it" | ./igor
+
+# change the API key, base URL and model
+./igor --setup
 ```
 
 In interactive mode the conversation history is kept across turns and written to
 disk, so a restart continues where you left off. Slash commands: `/help`,
-`/clear` (forget the conversation and remove the file), `/exit` (quit). See
-[The conversation](#the-conversation).
+`/setup` (change the provider settings), `/clear` (forget the conversation and
+remove the file), `/exit` (quit). See [The conversation](#the-conversation).
 
 ### Other OpenAI-compatible providers
 
@@ -336,10 +381,11 @@ repository.
 igor/
 ├── Makefile
 ├── src/
-│   ├── main.c        # entry point, env/CLI parsing
+│   ├── main.c        # entry point, CLI parsing, first-run setup, console I/O
 │   ├── agent.c       # agent loop, request/response, tool execution
 │   ├── http.c        # HTTPS POST (WinHTTP on Win32, OpenSSL on POSIX)
-│   └── json.c        # minimal JSON parser + string escaping
+│   ├── json.c        # minimal JSON parser + string escaping
+│   └── config.c      # the saved settings file
 └── build_iso.sh      # (gitignored) build + ISO packaging + deploy
 └── deploy.sh         # (gitignored) build + copy onto the target machine
 ```

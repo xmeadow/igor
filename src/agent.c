@@ -5,6 +5,7 @@
 #include "agent.h"
 #include "json.h"
 #include "http.h"
+#include "config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -544,6 +545,7 @@ static void keep_upto(sb_t *out, const char *data, size_t n, int *capped) {
 
 static int command_timeout_ms(void) {
     const char *v = getenv("IGOR_COMMAND_TIMEOUT");
+    if (!v || !*v) v = config_get("IGOR_COMMAND_TIMEOUT");
     if (v && *v) {
         int secs = atoi(v);
         if (secs > 0) return secs * 1000;
@@ -2280,6 +2282,11 @@ static int http_turn(agent_session_t *s, int with_tools,
 
     if (status != 200) {
         note(cfg, IGOR_ERROR, "error: http status %ld\n%s\n", status, resp ? resp : "");
+        /* The one failure a new user is most likely to hit, and the one the raw
+         * response explains worst. */
+        if (status == 401 || status == 403)
+            note(cfg, IGOR_ERROR,
+                 "the key was refused - `igor --setup` sets a new one\n");
         free(resp);
         if (streaming) stream_free(&st);
         return 0;

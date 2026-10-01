@@ -21,6 +21,9 @@
 #endif
 
 #include "agent.h"
+#include "config.h"
+
+#define IGOR_VERSION "0.8.1"
 
 /* The one line that says what is happening, drawn on stderr and overwritten in
  * place; defined with the rest of the output code below. */
@@ -56,15 +59,21 @@ static int stdout_tty;
  * says. */
 #define DEFAULT_CONTEXT_TOKENS 32000
 
-static const char *env_or(const char *name, const char *def) {
+/* A setting is looked for in the environment first, then in the file the setup
+ * wrote, then in the built-in default. The environment wins so a single run can
+ * be pointed somewhere else without disturbing what was set up once. */
+static const char *setting(const char *name, const char *def) {
     const char *v = getenv(name);
-    return (v && *v) ? v : def;
+    if (v && *v) return v;
+    v = config_get(name);
+    if (v && *v) return v;
+    return def;
 }
 
-/* An env switch is on unless it is explicitly off, so `IGOR_X=1` and
- * `IGOR_X=yes` enable it; unset or empty falls back to the default. */
-static int env_on(const char *name, int def) {
-    const char *v = getenv(name);
+/* A switch is on unless it is explicitly off, so `IGOR_X=1` and `IGOR_X=yes`
+ * enable it; unset or empty falls back to the default. */
+static int setting_on(const char *name, int def) {
+    const char *v = setting(name, NULL);
     if (!v || !*v) return def;
     return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
 }
@@ -400,14 +409,217 @@ static void trim(char *s) {
         s[--n] = 0;
 }
 
+/* ---- first-run setup ----
+ *
+ * Without a key igor used to print one line and stop, which tells somebody who
+ * has just built it nothing about what to do next. Run from a terminal it now
+ * asks instead, and writes the answers where the next start will find them.
+ */
+
+/* Typing a key into a screen that echoes it is how keys end up in screenshots
+ * and scrollback. Turning the echo off is best-effort: a console that will not
+ * do it still gets to finish the setup, it just shows what is typed. */
+static int echo_was_off;
+
+#ifdef _WIN32
+static DWORD saved_console_mode;
+
+static int echo_off(void) {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    if (!GetConsoleMode(h, &mode)) return 0;
+    saved_console_mode = mode;
+    if (!SetConsoleMode(h, mode & ~(DWORD)ENABLE_ECHO_INPUT)) return 0;
+    echo_was_off = 1;
+    return 1;
+}
+
+static void echo_restore(void) {
+    if (!echo_was_off) return;
+    SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), saved_console_mode);
+    echo_was_off = 0;
+}
+#else
+static struct termios saved_termios;
+
+/* TCSADRAIN, not TCSAFLUSH: flushing would throw away input that is already
+ * queued, which is how a setup driven from a script loses the key it was fed.
+ * What that would buy - discarding a key typed before the prompt - is worth
+ * little, since the echo it was meant to prevent has happened by then. */
+static int echo_off(void) {
+    struct termios t;
+    if (tcgetattr(STDIN_FILENO, &t) != 0) return 0;
+    saved_termios = t;
+    t.c_lflag &= ~(tcflag_t)ECHO;
+    if (tcsetattr(STDIN_FILENO, TCSADRAIN, &t) != 0) return 0;
+    echo_was_off = 1;
+    return 1;
+}
+
+static void echo_restore(void) {
+    if (!echo_was_off) return;
+    tcsetattr(STDIN_FILENO, TCSADRAIN, &saved_termios);
+    echo_was_off = 0;
+}
+#endif
+
+/* Ask one question and return the answer, or a copy of def when the line is
+ * left empty. NULL means end-of-input: the caller gives up rather than looping
+ * on a stdin that has nothing left to give. */
+static char *ask(const char *question, const char *def, int hidden) {
+    char *line;
+
+    out_puts(question);
+    if (def && *def) {
+        out_puts(" [");
+        out_puts(def);
+        out_puts("]");
+    }
+    out_puts(": ");
+    fflush(stdout);
+
+    if (hidden) echo_off();
+    line = read_line_utf8(stdin);
+    if (hidden) {
+        echo_restore();
+        out_puts("\n"); /* the user's Return was swallowed with the echo */
+        fflush(stdout);
+    }
+    if (!line) return NULL;
+
+    trim(line);
+    if (!*line) {
+        free(line);
+        return def ? strdup(def) : strdup("");
+    }
+    return line;
+}
+
+/* The endpoints people are most likely to have an account with, so the common
+ * case is one keypress. Anything speaking the OpenAI protocol works, which is
+ * what the last entry is for. */
+static const struct {
+    const char *name;
+    const char *base_url;
+    const char *model;
+} providers[] = {
+    { "OpenAI",     "https://api.openai.com/v1",    "gpt-4o-mini" },
+    { "DeepSeek",   "https://api.deepseek.com",     "deepseek-chat" },
+    { "Mistral",    "https://api.mistral.ai/v1",    "mistral-small-latest" },
+    { "OpenRouter", "https://openrouter.ai/api/v1", "openai/gpt-4o-mini" },
+    { "A local server (Ollama, llama.cpp, ...)", "http://localhost:11434/v1", "llama3.2" },
+};
+#define PROVIDER_COUNT ((int)(sizeof(providers) / sizeof(providers[0])))
+
+/* Returns 1 when settings were written, 0 when the user gave up. */
+static int run_setup(void) {
+    char path[512];
+    char line[64];
+    const char *err = NULL;
+    const char *base_default, *model_default;
+    char *key = NULL, *base_url = NULL, *model = NULL;
+    int choice = 0, local;
+
+    out_puts("\nigor needs an API key for a language model before it can do\n"
+             "anything. This asks once and remembers the answers.\n\n");
+
+    for (int i = 0; i < PROVIDER_COUNT; i++) {
+        snprintf(line, sizeof(line), "  %d) ", i + 1);
+        out_puts(line);
+        out_puts(providers[i].name);
+        out_puts("\n");
+    }
+    snprintf(line, sizeof(line), "  %d) Something else\n\n", PROVIDER_COUNT + 1);
+    out_puts(line);
+
+    for (;;) {
+        char *answer = ask("Which one", "1", 0);
+        if (!answer) return 0;
+        choice = atoi(answer);
+        free(answer);
+        if (choice >= 1 && choice <= PROVIDER_COUNT + 1) break;
+        out_puts("Pick one of the numbers above.\n");
+        fflush(stdout);
+    }
+
+    if (choice <= PROVIDER_COUNT) {
+        base_default = providers[choice - 1].base_url;
+        model_default = providers[choice - 1].model;
+    } else {
+        base_default = NULL;
+        model_default = NULL;
+    }
+    /* A server on this machine usually wants no key at all. */
+    local = (choice <= PROVIDER_COUNT &&
+             strncmp(providers[choice - 1].base_url, "http://localhost", 16) == 0);
+
+    base_url = ask("API base URL", base_default, 0);
+    if (!base_url || !*base_url) goto give_up;
+
+    out_puts("\nThe key is not shown while you type it.\n");
+    key = ask("API key", local ? "none" : NULL, 1);
+    if (!key || !*key) goto give_up;
+
+    model = ask("Model", model_default, 0);
+    if (!model || !*model) goto give_up;
+
+    if (!config_save(key, base_url, model, &err)) {
+        out_kind("\ncould not save the settings", IGOR_ERROR);
+        if (err) {
+            out_kind(": ", IGOR_ERROR);
+            out_kind(err, IGOR_ERROR);
+        }
+        out_puts("\n");
+        goto give_up;
+    }
+
+    out_puts("\nSaved");
+    if (config_path(path, sizeof(path))) {
+        out_puts(" to ");
+        out_puts(path);
+    }
+    out_puts(".\nChange it later with `igor --setup`, or set LLM_API_KEY,\n"
+             "LLM_BASE_URL and LLM_MODEL in the environment to override it.\n\n");
+    fflush(stdout);
+
+    free(key);
+    free(base_url);
+    free(model);
+    return 1;
+
+give_up:
+    free(key);
+    free(base_url);
+    free(model);
+    return 0;
+}
+
 static void print_help(void) {
     out_puts("Commands:\n"
              "  /help    show this help\n"
+             "  /setup   change the API key, base URL and model\n"
              "  /clear   forget the conversation, history file included\n"
              "  /exit    quit (also /quit or 'exit')\n"
              "\n"
              "Anything else is sent to the agent.\n");
     fflush(stdout);
+}
+
+static void print_usage(void) {
+    printf("igor " IGOR_VERSION " - a small coding agent\n"
+           "\n"
+           "usage:\n"
+           "  igor                 interactive chat\n"
+           "  igor \"task\"          run one task and exit\n"
+           "  echo task | igor     run one task read from stdin\n"
+           "\n"
+           "options:\n"
+           "  --setup              set the API key, base URL and model, and save them\n"
+           "  --version            print the version\n"
+           "  --help               print this\n"
+           "\n"
+           "Settings come from the environment (LLM_API_KEY, LLM_BASE_URL,\n"
+           "LLM_MODEL) first, then from the file written by --setup.\n");
 }
 
 static int run_once(const agent_config_t *cfg, const char *task) {
@@ -428,14 +640,30 @@ static int run_once(const agent_config_t *cfg, const char *task) {
     return rc;
 }
 
-static int interactive_loop(const agent_config_t *cfg) {
+/* Copy the three provider settings out of the environment and the saved file.
+ * They are copied because --setup rewrites the file and drops what was read
+ * from it, and a pointer into that would not survive the rewrite. */
+static void load_provider_settings(agent_config_t *cfg) {
+    const char *v;
+
+    free((void *)cfg->api_key);
+    free((void *)cfg->base_url);
+    free((void *)cfg->model);
+
+    v = setting("LLM_API_KEY", LLM_API_KEY);
+    cfg->api_key = v ? strdup(v) : NULL;
+    cfg->base_url = strdup(setting("LLM_BASE_URL", LLM_BASE_URL));
+    cfg->model = strdup(setting("LLM_MODEL", LLM_MODEL));
+}
+
+static int interactive_loop(agent_config_t *cfg) {
     agent_session_t *s = agent_session_new(cfg);
     if (!s) {
         fprintf(stderr, "error: out of memory\n");
         return 1;
     }
 
-    out_puts("igor - coding agent. Type a task, or /help, /clear, /exit.\n\n");
+    out_puts("igor " IGOR_VERSION " - coding agent. Type a task, or /help, /setup, /clear, /exit.\n\n");
     fflush(stdout);
 
     int rc = 0;
@@ -472,6 +700,25 @@ static int interactive_loop(const agent_config_t *cfg) {
             free(line);
             continue;
         }
+        if (strcmp(line, "/setup") == 0) {
+            answer_started = 1; /* a plain notice, not an answer block */
+            free(line);
+            if (run_setup()) {
+                /* The session holds a copy of the settings, so it is built
+                 * again to pick the new ones up. The conversation is on disk
+                 * and comes back with it. */
+                agent_session_t *fresh;
+                load_provider_settings(cfg);
+                fresh = agent_session_new(cfg);
+                if (!fresh) {
+                    out_kind("error: out of memory\n", IGOR_ERROR);
+                    break;
+                }
+                agent_session_free(s);
+                s = fresh;
+            }
+            continue;
+        }
 
         char *ans = agent_chat(s, line);
         free(line);
@@ -485,7 +732,7 @@ static int interactive_loop(const agent_config_t *cfg) {
 }
 
 int main(int argc, char **argv) {
-    agent_config_t cfg;
+    agent_config_t cfg = {0};
     int history_off = 0;
 #ifdef _WIN32
     {
@@ -505,24 +752,50 @@ int main(int argc, char **argv) {
     stdout_tty = stdout_is_tty;
 #endif
 
-    cfg.api_key = env_or("LLM_API_KEY", LLM_API_KEY);
-    if (!cfg.api_key) {
-        fprintf(stderr, "error: LLM_API_KEY is not set\n");
+    if (argc > 1) {
+        if (strcmp(argv[1], "--setup") == 0)
+            return run_setup() ? 0 : 1;
+        if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0) {
+            printf("igor " IGOR_VERSION "\n");
+            return 0;
+        }
+        if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+            print_usage();
+            return 0;
+        }
+        /* Anything else is the task - but a mistyped option is not a task, and
+         * sending it to the model would hide the typo behind an answer. */
+        if (argv[1][0] == '-' && argv[1][1] == '-') {
+            fprintf(stderr, "error: unknown option %s\n\n", argv[1]);
+            print_usage();
+            return 1;
+        }
+    }
+
+    load_provider_settings(&cfg);
+    if (!cfg.api_key || !*cfg.api_key) {
+        /* Nothing in the environment and nothing saved. Somebody sitting at a
+         * terminal can be asked for it; a script cannot, and is told where to
+         * put it instead. */
+        if (stdin_is_tty() && stdout_tty && run_setup())
+            load_provider_settings(&cfg);
+    }
+    if (!cfg.api_key || !*cfg.api_key) {
+        fprintf(stderr, "error: no API key. Run `igor --setup`, "
+                        "or set LLM_API_KEY in the environment.\n");
         return 1;
     }
-    cfg.base_url = env_or("LLM_BASE_URL", LLM_BASE_URL);
-    cfg.model = env_or("LLM_MODEL", LLM_MODEL);
     cfg.out = out_kind;
     cfg.note = note_kind;
     cfg.status = status_mark;
-    cfg.stream = env_on("LLM_STREAM", 1);
+    cfg.stream = setting_on("LLM_STREAM", 1);
     /* Off by default: shown in full, the reasoning buries the answer. It is
      * still reachable for debugging with IGOR_SHOW_THINKING=1. */
-    cfg.show_thought = env_on("IGOR_SHOW_THINKING", 0);
+    cfg.show_thought = setting_on("IGOR_SHOW_THINKING", 0);
     cfg.context_tokens = DEFAULT_CONTEXT_TOKENS;
     cfg.history_path = NULL;
     {
-        const char *v = getenv("IGOR_CONTEXT_TOKENS");
+        const char *v = setting("IGOR_CONTEXT_TOKENS", NULL);
         if (v && *v) {
             long n = atol(v);
             if (n > 0) cfg.context_tokens = n;
@@ -534,11 +807,11 @@ int main(int argc, char **argv) {
      * persistence off with off/none/-/0. Left unset, an interactive session
      * keeps one and a one-shot task keeps nothing. */
     {
-        const char *v = getenv("IGOR_HISTORY");
+        const char *v = setting("IGOR_HISTORY", NULL);
         history_off = (v && *v) ? value_off(v) : 0;
         if (v && *v && !history_off) cfg.history_path = v;
     }
-    const char *ms = getenv("LLM_MAX_STEPS");
+    const char *ms = setting("LLM_MAX_STEPS", NULL);
     cfg.max_steps = (ms && *ms) ? atoi(ms) : 16;
     if (cfg.max_steps <= 0) cfg.max_steps = 16;
 
@@ -563,7 +836,7 @@ int main(int argc, char **argv) {
 
     char *task = read_stdin();
     if (!task || !*task) {
-        fprintf(stderr, "usage: igor \"task\"   (or run interactively: igor)\n");
+        print_usage();
         if (task) free(task);
         return 1;
     }
