@@ -1,5 +1,7 @@
 # igor
 
+[![build](https://github.com/xmeadow/igor/actions/workflows/build.yml/badge.svg)](https://github.com/xmeadow/igor/actions/workflows/build.yml)
+
 A minimal, dependency-free coding agent written in **C**. Primary target is
 **Win32 (ReactOS)**, but the same source builds and runs on Linux too.
 
@@ -7,6 +9,28 @@ The agent drives an LLM in a loop, runs shell commands through the native
 process API (`CreateProcess` on Windows, `popen` on Linux), and lets the model
 read and write files — so it can compile and iterate on code with
 `gcc`/`mingw32` on ReactOS.
+
+## Contents
+
+- [Design](#design)
+- [Requirements](#requirements)
+- [Build](#build)
+- [Configuration](#configuration)
+- [Usage](#usage)
+  - [Other OpenAI-compatible providers](#other-openai-compatible-providers)
+- [Tools](#tools)
+- [Telling thought, work and answer apart](#telling-thought-work-and-answer-apart)
+- [The status line](#the-status-line)
+- [Streaming](#streaming)
+- [The conversation](#the-conversation)
+  - [Staying inside the window](#staying-inside-the-window)
+  - [What a request cost](#what-a-request-cost)
+- [How it works](#how-it-works)
+- [Prep prompt](#prep-prompt)
+  - [Project instructions](#project-instructions)
+  - [Skills](#skills)
+- [Project layout](#project-layout)
+- [ReactOS / Win32 notes](#reactos--win32-notes)
 
 ## Design
 
