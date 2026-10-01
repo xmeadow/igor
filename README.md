@@ -31,6 +31,7 @@ read and write files — so it can compile and iterate on code with
   - [Skills](#skills)
 - [Project layout](#project-layout)
 - [ReactOS / Win32 notes](#reactos--win32-notes)
+- [License](#license)
 
 ## Design
 
@@ -372,3 +373,7 @@ Win32 code works around them:
 - **`PATH` is fixed for tool calls.** ReactOS ships a `PATH` pointing at a
   non-existent `C:\Windows`, so no system tool is reachable by bare name; igor
   prepends `%SystemRoot%\system32;%SystemRoot%`.
+
+## License
+
+[MIT](LICENSE)
