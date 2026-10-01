@@ -28,7 +28,9 @@ jobs:
           mkdir dist
           cp igor     "dist/igor-${GITHUB_REF_NAME}-linux-x86_64"
           cp igor.exe "dist/igor-${GITHUB_REF_NAME}-win32-i686.exe"
-          sha256sum dist/* > dist/SHA256SUMS
+          # From inside dist, so the names in the file are the names the
+          # assets have once downloaded - `sha256sum -c` works where they land.
+          cd dist && sha256sum igor-* > SHA256SUMS
 
       - name: Publish the release
         env:
